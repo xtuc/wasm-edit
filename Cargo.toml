@@ -1,0 +1,14 @@
+[package]
+name = "wasm-edit"
+version = "0.1.0"
+edition = "2021"
+description = "Edit and instrument already compiled Wasm binaries"
+authors = ["Sven Sauleau <sven@cloudflare.com>"]
+license = "MIT"
+keywords = ["wasm", "edit", "transform", "parser", "instrument"]
+repository = "https://github.com/xtuc/wasm-edit"
+
+[dependencies]
+clap = { version = "4.0.17", features = ["derive"] }
+leb128 = "0.2.5"
+nom = "7"
