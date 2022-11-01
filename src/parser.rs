@@ -1,5 +1,7 @@
 use crate::ast;
 use nom::bytes::complete::take;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 type BoxError = Box<dyn std::error::Error>;
 
@@ -129,19 +131,20 @@ fn decode_module<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Mo
 
     let mut ctx = ctx;
 
-    let mut module = ast::Module {
-        sections: Vec::new(),
-    };
-
+    let mut sections = vec![];
     loop {
         let res = decode_section(ctx)?;
         ctx = res.0;
-        module.sections.push(res.1);
+        sections.push(res.1);
 
         if ctx.input.is_empty() {
             break;
         }
     }
+
+    let module = ast::Module {
+        sections: Rc::new(RefCell::new(sections)),
+    };
     Ok((ctx, module))
 }
 
@@ -149,8 +152,95 @@ fn decode_section_memory<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>,
     decode_vec(ctx, decode_memory)
 }
 
+fn decode_section_data<'a>(
+    ctx: InputContext<'a>,
+) -> IResult<InputContext<'a>, Vec<ast::DataSegment>> {
+    decode_vec(ctx, decode_data)
+}
+
+fn decode_section_type<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, Vec<ast::Type>> {
+    decode_vec(ctx, decode_type)
+}
+
+fn decode_section_func<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, Vec<u32>> {
+    decode_vec(ctx, |ctx| ctx.read_leb128())
+}
+
+fn decode_section_table<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, Vec<ast::Table>> {
+    decode_vec(ctx, decode_table)
+}
+
+fn decode_section_import<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, Vec<ast::Import>> {
+    decode_vec(ctx, decode_import)
+}
+
 fn decode_section_code<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, Vec<ast::Code>> {
     decode_vec(ctx, decode_code)
+}
+
+fn decode_reftype<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Reftype> {
+    let (ctx, t) = ctx.read_u8()?;
+    Ok((
+        ctx,
+        match t {
+            0x70 => ast::Reftype::Func,
+            0x6F => ast::Reftype::Extern,
+            _ => unimplemented!("unsupported reftype: {}", t),
+        },
+    ))
+}
+
+fn decode_limits<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Limits> {
+    let (ctx, t) = ctx.read_u8()?;
+    Ok(match t {
+        0x00 => {
+            let (ctx, min) = ctx.read_leb128()?;
+            (ctx, ast::Limits { min, max: None })
+        }
+        0x01 => {
+            let (ctx, min) = ctx.read_leb128()?;
+            let (ctx, max) = ctx.read_leb128()?;
+            (
+                ctx,
+                ast::Limits {
+                    min,
+                    max: Some(max),
+                },
+            )
+        }
+        _ => unimplemented!("unsupported limit: {}", t),
+    })
+}
+
+fn decode_table<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Table> {
+    let (ctx, reftype) = decode_reftype(ctx)?;
+    let (ctx, limits) = decode_limits(ctx)?;
+    let table = ast::Table { reftype, limits };
+    Ok((ctx, table))
+}
+
+fn decode_import<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Import> {
+    let (ctx, module) = decode_name(ctx)?;
+    let (ctx, name) = decode_name(ctx)?;
+
+    let (ctx, descr_t) = ctx.read_u8()?;
+    let (ctx, typeidx) = match descr_t {
+        0 => ctx.read_leb128()?,
+        _ => unimplemented!("import description: {:x}", descr_t),
+    };
+
+    let import = ast::Import {
+        module,
+        name,
+        typeidx,
+    };
+    Ok((ctx, import))
+}
+
+fn decode_name<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, String> {
+    let (ctx, bytes) = decode_vec(ctx, |ctx| ctx.read_u8())?;
+    let v = String::from_utf8_lossy(&bytes).to_string();
+    Ok((ctx, v))
 }
 
 fn decode_code<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Code> {
@@ -173,6 +263,9 @@ fn decode_code<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Code
         };
         let (ctx, locals) = decode_vec(ctx, decode_code_local)?;
         let (_ctx, body) = decode_expr(ctx, ast::Instr::end)?;
+        let body = Rc::new(RefCell::new(body));
+
+        // Bytes are split before, no need to propagate this context.
         ast::Code { size, locals, body }
     };
 
@@ -279,9 +372,53 @@ fn decode_instr<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Val
             }
         };
 
+        ($byte:expr, $instr:ident(MutableValue<u32>)) => {
+            if id == $byte {
+                let arg_start_offset = ctx.offset;
+                let (ctx, arg0) = ctx.read_leb128()?;
+                let end_offset = ctx.offset;
+
+                let arg0 = ast::Value {
+                    start_offset: arg_start_offset,
+                    value: arg0,
+                    end_offset,
+                };
+
+                let value = ast::Value {
+                    start_offset,
+                    value: ast::Instr::$instr(Rc::new(RefCell::new(arg0))),
+                    end_offset,
+                };
+                return Ok((ctx, value));
+            }
+        };
+
         ($byte:expr, $instr:ident(u32, u32)) => {
             if id == $byte {
                 let (ctx, arg0) = ctx.read_leb128()?;
+                let (ctx, arg1) = ctx.read_leb128()?;
+                let end_offset = ctx.offset;
+
+                let value = ast::Value {
+                    start_offset,
+                    value: ast::Instr::$instr(arg0, arg1),
+                    end_offset,
+                };
+                return Ok((ctx, value));
+            }
+        };
+
+        ($byte:expr, $instr:ident(MutableValue<u32>, u32)) => {
+            if id == $byte {
+                let start_offset = ctx.offset;
+                let (ctx, arg0) = ctx.read_leb128()?;
+                let end_offset = ctx.offset;
+                let arg0 = Rc::new(RefCell::new(ast::Value {
+                    start_offset,
+                    value: arg0,
+                    end_offset,
+                }));
+
                 let (ctx, arg1) = ctx.read_leb128()?;
                 let end_offset = ctx.offset;
 
@@ -320,7 +457,7 @@ fn decode_instr<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Val
 
         let value = ast::Value {
             start_offset,
-            value: ast::Instr::Block(ret_type, body),
+            value: ast::Instr::Block(ret_type, Rc::new(RefCell::new(body))),
             end_offset,
         };
         return Ok((ctx, value));
@@ -332,7 +469,7 @@ fn decode_instr<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Val
 
         let value = ast::Value {
             start_offset,
-            value: ast::Instr::Loop(ret_type, body),
+            value: ast::Instr::Loop(ret_type, Rc::new(RefCell::new(body))),
             end_offset,
         };
         return Ok((ctx, value));
@@ -346,7 +483,7 @@ fn decode_instr<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Val
 
         let value = ast::Value {
             start_offset,
-            value: ast::Instr::If(ret_type, body),
+            value: ast::Instr::If(ret_type, Rc::new(RefCell::new(body))),
             end_offset,
         };
         return Ok((ctx, value));
@@ -358,7 +495,7 @@ fn decode_instr<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Val
     decode_instr!(0x05, else_end);
     decode_instr!(0x0e, br_table(Vec<u32>, u32));
     decode_instr!(0x0f, Return);
-    decode_instr!(0x10, call(u32));
+    decode_instr!(0x10, call(MutableValue<u32>));
     decode_instr!(0x11, call_indirect(u32, u32));
 
     decode_instr!(0x1a, drop);
@@ -373,30 +510,30 @@ fn decode_instr<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Val
     decode_instr!(0x25, table_get(u32));
     decode_instr!(0x26, table_set(u32));
 
-    decode_instr!(0x28, i32_load(u32, u32));
-    decode_instr!(0x29, i64_load(u32, u32));
-    decode_instr!(0x2a, f32_load(u32, u32));
-    decode_instr!(0x2b, f64_load(u32, u32));
-    decode_instr!(0x2c, i32_load8_s(u32, u32));
-    decode_instr!(0x2d, i32_load8_u(u32, u32));
-    decode_instr!(0x2e, i32_load16_s(u32, u32));
-    decode_instr!(0x2f, i32_load16_u(u32, u32));
-    decode_instr!(0x30, i64_load8_s(u32, u32));
-    decode_instr!(0x31, i64_load8_u(u32, u32));
-    decode_instr!(0x32, i64_load16_s(u32, u32));
-    decode_instr!(0x33, i64_load16_u(u32, u32));
-    decode_instr!(0x34, i64_load32_s(u32, u32));
-    decode_instr!(0x35, i64_load32_u(u32, u32));
+    decode_instr!(0x28, i32_load(MutableValue<u32>, u32));
+    decode_instr!(0x29, i64_load(MutableValue<u32>, u32));
+    decode_instr!(0x2a, f32_load(MutableValue<u32>, u32));
+    decode_instr!(0x2b, f64_load(MutableValue<u32>, u32));
+    decode_instr!(0x2c, i32_load8_s(MutableValue<u32>, u32));
+    decode_instr!(0x2d, i32_load8_u(MutableValue<u32>, u32));
+    decode_instr!(0x2e, i32_load16_s(MutableValue<u32>, u32));
+    decode_instr!(0x2f, i32_load16_u(MutableValue<u32>, u32));
+    decode_instr!(0x30, i64_load8_s(MutableValue<u32>, u32));
+    decode_instr!(0x31, i64_load8_u(MutableValue<u32>, u32));
+    decode_instr!(0x32, i64_load16_s(MutableValue<u32>, u32));
+    decode_instr!(0x33, i64_load16_u(MutableValue<u32>, u32));
+    decode_instr!(0x34, i64_load32_s(MutableValue<u32>, u32));
+    decode_instr!(0x35, i64_load32_u(MutableValue<u32>, u32));
 
-    decode_instr!(0x36, i32_store(u32, u32));
-    decode_instr!(0x37, i64_store(u32, u32));
-    decode_instr!(0x38, f32_store(u32, u32));
-    decode_instr!(0x39, f64_store(u32, u32));
-    decode_instr!(0x3a, i32_store8(u32, u32));
-    decode_instr!(0x3b, i32_store16(u32, u32));
-    decode_instr!(0x3c, i64_store8(u32, u32));
-    decode_instr!(0x3d, i64_store16(u32, u32));
-    decode_instr!(0x3e, i64_store32(u32, u32));
+    decode_instr!(0x36, i32_store(MutableValue<u32>, u32));
+    decode_instr!(0x37, i64_store(MutableValue<u32>, u32));
+    decode_instr!(0x38, f32_store(MutableValue<u32>, u32));
+    decode_instr!(0x39, f64_store(MutableValue<u32>, u32));
+    decode_instr!(0x3a, i32_store8(MutableValue<u32>, u32));
+    decode_instr!(0x3b, i32_store16(MutableValue<u32>, u32));
+    decode_instr!(0x3c, i64_store8(MutableValue<u32>, u32));
+    decode_instr!(0x3d, i64_store16(MutableValue<u32>, u32));
+    decode_instr!(0x3e, i64_store32(MutableValue<u32>, u32));
 
     decode_instr!(0x3f, memory_size(u8));
     decode_instr!(0x40, memory_grow(u8));
@@ -551,19 +688,27 @@ fn decode_instr<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Val
 fn decode_expr<'a>(
     ctx: InputContext<'a>,
     end_instr: ast::Instr,
-) -> IResult<InputContext<'a>, Vec<ast::Value<ast::Instr>>> {
+) -> IResult<InputContext<'a>, ast::Value<Vec<ast::Value<ast::Instr>>>> {
+    let start_offset = ctx.offset;
+
     let mut ctx = ctx;
     let mut vec = Vec::new();
     loop {
         let ret = decode_instr(ctx)?;
         ctx = ret.0;
+        vec.push(ret.1.clone());
         if ret.1.value == end_instr {
             break;
         }
-        vec.push(ret.1);
     }
 
-    Ok((ctx, vec))
+    let end_offset = ctx.offset;
+    let value = ast::Value {
+        start_offset,
+        value: vec,
+        end_offset,
+    };
+    Ok((ctx, value))
 }
 
 fn decode_code_local<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::CodeLocal> {
@@ -585,6 +730,35 @@ fn decode_valtype<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::V
             e => unimplemented!("unsupported type: {:x}", e),
         },
     ))
+}
+
+fn decode_type<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Type> {
+    let (ctx, b) = ctx.read_u8()?;
+    if b != 0x60 {
+        panic!("unexpected type");
+    }
+    let (ctx, params) = decode_vec(ctx, decode_valtype)?;
+    let (ctx, results) = decode_vec(ctx, decode_valtype)?;
+
+    let t = ast::Type { params, results };
+    Ok((ctx, t))
+}
+
+fn decode_data<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::DataSegment> {
+    let (ctx, t) = ctx.read_leb128()?;
+
+    match t {
+        0 => {
+            let (ctx, expr) = decode_expr(ctx, ast::Instr::end)?;
+            let (ctx, bytes) = decode_vec(ctx, |ctx| ctx.read_u8())?;
+            let data_segment = ast::DataSegment {
+                offset: expr,
+                bytes,
+            };
+            Ok((ctx, data_segment))
+        }
+        _ => unimplemented!("data segment of type: {}", t),
+    }
 }
 
 fn decode_memory<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Memory> {
@@ -629,15 +803,43 @@ fn decode_section<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::S
     };
 
     let section = match id {
+        2 => {
+            let (_, res) = decode_section_import(section_bytes)?;
+            ast::Section::Import((section_size, Rc::new(RefCell::new(res))))
+        }
+        3 => {
+            let (_, res) = decode_section_func(section_bytes)?;
+            ast::Section::Func((section_size, Rc::new(RefCell::new(res))))
+        }
+        4 => {
+            let (_, res) = decode_section_table(section_bytes)?;
+            ast::Section::Table((section_size, Rc::new(RefCell::new(res))))
+        }
         5 => {
             let (_, res) = decode_section_memory(section_bytes)?;
             ast::Section::Memory((section_size, res))
         }
         10 => {
+            let start_offset = ctx.offset;
             let (_, res) = decode_section_code(section_bytes)?;
-            ast::Section::Code((section_size, res))
+            let end_offset = ctx.offset;
+
+            let value = ast::Value {
+                start_offset,
+                value: res,
+                end_offset,
+            };
+            ast::Section::Code((section_size, Rc::new(RefCell::new(value))))
         }
-        _ => ast::Section::Unknown,
+        11 => {
+            let (_, res) = decode_section_data(section_bytes)?;
+            ast::Section::Data((section_size, Rc::new(RefCell::new(res))))
+        }
+        1 => {
+            let (_, res) = decode_section_type(section_bytes)?;
+            ast::Section::Type((section_size, Rc::new(RefCell::new(res))))
+        }
+        id => ast::Section::Unknown((id, size, section_bytes.input.to_vec())),
     };
     Ok((ctx, section))
 }

@@ -2,39 +2,53 @@
 // Allow non camel case types because it's easier to copy paste from the
 // Wasm reference interpreter.
 
-#[derive(Debug, PartialEq)]
+use std::cell::RefCell;
+use std::rc::Rc;
+
+#[derive(Debug, PartialEq, Clone)]
 pub struct Value<T> {
     pub value: T,
     pub start_offset: usize,
     pub end_offset: usize,
 }
+impl<T> Value<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            start_offset: 0,
+            end_offset: 0,
+            value,
+        }
+    }
+}
 
-#[derive(Debug)]
+pub type MutableValue<T> = Rc<RefCell<Value<T>>>;
+
+#[derive(Debug, Clone)]
 pub struct Memory {
     pub initial_memory: Value<u32>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Code {
     pub size: Value<u32>,
     pub locals: Vec<CodeLocal>,
-    pub body: Vec<Value<Instr>>,
+    pub body: MutableValue<Vec<Value<Instr>>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CodeLocal {
     pub count: u32,
     pub value_type: ValueType,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ValueType {
     NumType(NumType),
     // VectorType(),
     // RefType(),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum NumType {
     I32,
     I64,
@@ -42,12 +56,49 @@ pub enum NumType {
     F64,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone)]
+pub enum Reftype {
+    Func,
+    Extern,
+}
+
+#[derive(Debug, Clone)]
+pub struct Limits {
+    pub min: u32,
+    pub max: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Table {
+    pub reftype: Reftype,
+    pub limits: Limits,
+}
+
+#[derive(Debug, Clone)]
+pub struct DataSegment {
+    pub offset: Value<Vec<Value<Instr>>>,
+    pub bytes: Vec<u8>,
+}
+
+impl DataSegment {
+    pub fn compute_offset(&self) -> i64 {
+        let expr = &self.offset.value;
+        for instr in expr {
+            if let Instr::i32_const(v) = instr.value {
+                return v;
+            }
+        }
+
+        panic!("malformed data expression: {:?}", expr)
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub enum Instr {
     unreachable,
     nop,
 
-    call(u32),
+    call(MutableValue<u32>),
     call_indirect(u32, u32),
 
     drop,
@@ -61,30 +112,30 @@ pub enum Instr {
     table_get(u32),
     table_set(u32),
 
-    i32_load(u32, u32),
-    i64_load(u32, u32),
-    f32_load(u32, u32),
-    f64_load(u32, u32),
-    i32_load8_s(u32, u32),
-    i32_load8_u(u32, u32),
-    i32_load16_s(u32, u32),
-    i32_load16_u(u32, u32),
-    i64_load8_s(u32, u32),
-    i64_load8_u(u32, u32),
-    i64_load16_s(u32, u32),
-    i64_load16_u(u32, u32),
-    i64_load32_s(u32, u32),
-    i64_load32_u(u32, u32),
+    i32_load(MutableValue<u32>, u32),
+    i64_load(MutableValue<u32>, u32),
+    f32_load(MutableValue<u32>, u32),
+    f64_load(MutableValue<u32>, u32),
+    i32_load8_s(MutableValue<u32>, u32),
+    i32_load8_u(MutableValue<u32>, u32),
+    i32_load16_s(MutableValue<u32>, u32),
+    i32_load16_u(MutableValue<u32>, u32),
+    i64_load8_s(MutableValue<u32>, u32),
+    i64_load8_u(MutableValue<u32>, u32),
+    i64_load16_s(MutableValue<u32>, u32),
+    i64_load16_u(MutableValue<u32>, u32),
+    i64_load32_s(MutableValue<u32>, u32),
+    i64_load32_u(MutableValue<u32>, u32),
 
-    i32_store(u32, u32),
-    i64_store(u32, u32),
-    f32_store(u32, u32),
-    f64_store(u32, u32),
-    i32_store8(u32, u32),
-    i32_store16(u32, u32),
-    i64_store8(u32, u32),
-    i64_store16(u32, u32),
-    i64_store32(u32, u32),
+    i32_store(MutableValue<u32>, u32),
+    i64_store(MutableValue<u32>, u32),
+    f32_store(MutableValue<u32>, u32),
+    f64_store(MutableValue<u32>, u32),
+    i32_store8(MutableValue<u32>, u32),
+    i32_store16(MutableValue<u32>, u32),
+    i64_store8(MutableValue<u32>, u32),
+    i64_store16(MutableValue<u32>, u32),
+    i64_store32(MutableValue<u32>, u32),
 
     memory_size(u8),
     memory_grow(u8),
@@ -95,9 +146,9 @@ pub enum Instr {
     else_end,
     end,
     Return,
-    Block(u8, Vec<Value<Instr>>),
-    Loop(u8, Vec<Value<Instr>>),
-    If(u8, Vec<Value<Instr>>),
+    Block(u8, MutableValue<Vec<Value<Instr>>>),
+    Loop(u8, MutableValue<Vec<Value<Instr>>>),
+    If(u8, MutableValue<Vec<Value<Instr>>>),
 
     i32_const(i64),
     i64_const(i64),
@@ -247,11 +298,30 @@ pub enum Instr {
 pub enum Section {
     /// (Size, Section)
     Memory((Value<u32>, Vec<Memory>)),
-    Code((Value<u32>, Vec<Code>)),
-    Unknown,
+    Data((Value<u32>, Rc<RefCell<Vec<DataSegment>>>)),
+    Code((Value<u32>, MutableValue<Vec<Code>>)),
+    Type((Value<u32>, Rc<RefCell<Vec<Type>>>)),
+    Func((Value<u32>, Rc<RefCell<Vec<u32>>>)),
+    Import((Value<u32>, Rc<RefCell<Vec<Import>>>)),
+    Table((Value<u32>, Rc<RefCell<Vec<Table>>>)),
+    /// (Id, Size, Section)
+    Unknown((u8, u32, Vec<u8>)),
 }
 
 #[derive(Debug)]
 pub struct Module {
-    pub sections: Vec<Section>,
+    pub sections: Rc<RefCell<Vec<Section>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Type {
+    pub params: Vec<ValueType>,
+    pub results: Vec<ValueType>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Import {
+    pub module: String,
+    pub name: String,
+    pub typeidx: u32,
 }
