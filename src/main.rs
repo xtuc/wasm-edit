@@ -1,9 +1,12 @@
+use std::cell::RefCell;
 use std::io::stdin;
 use std::io::stdout;
 use std::io::Read;
 use std::io::Write;
+use std::rc::Rc;
 
-use wasm_edit::{ast, parser, update_value};
+mod instrument;
+use wasm_edit::{ast, parser, printer, traverse, update_value};
 
 type BoxError = Box<dyn std::error::Error>;
 
@@ -31,6 +34,8 @@ struct Args {
 }
 
 fn main() -> Result<(), BoxError> {
+    env_logger::init();
+
     let args = Args::parse();
 
     let mut input = Vec::new();
@@ -54,10 +59,33 @@ fn main() -> Result<(), BoxError> {
         }
 
         Commands::InstrumentMemory { .. } => {
-            let (codes, _section_size) = get_code_section(&module).unwrap();
-            for code in codes {
-                visit_code(code, rewrite_memory_grow, &mut input)
-            }
+            let text_offset = {
+                let visitor = Rc::new(instrument::MemoryInstrumentAddData {
+                    text_offset: RefCell::new(0),
+                    text: "called memory.grow\n",
+                });
+                traverse::traverse(&module, Rc::clone(&visitor) as Rc<dyn traverse::Visitor>);
+
+                let v = visitor.text_offset.borrow();
+                *v
+            };
+
+            let funcidx = {
+                let visitor = Rc::new(instrument::MemoryInstrumentAddRuntime {
+                    text_offset,
+                    fd_write: RefCell::new(0),
+                    typeidx: RefCell::new(0),
+                    funcidx: RefCell::new(0),
+                });
+                traverse::traverse(&module, Rc::clone(&visitor) as Rc<dyn traverse::Visitor>);
+
+                let v = visitor.funcidx.borrow();
+                *v
+            };
+
+            let visitor = instrument::MemoryInstrument { funcidx };
+            traverse::traverse(&module, Rc::new(visitor));
+            input = printer::print(&module)?;
         }
     };
 
@@ -65,54 +93,15 @@ fn main() -> Result<(), BoxError> {
     Ok(())
 }
 
-fn rewrite_memory_grow<'a>(instr: &'a ast::Value<ast::Instr>, input: &mut Vec<u8>) {
-    if matches!(instr.value, ast::Instr::memory_grow(_)) {
-        let new_instr = ast::Instr::call(66);
-        let diff = update_value(input, &instr, new_instr);
-        assert_eq!(diff, 0);
-    }
-}
-
-fn get_main_memory<'a>(module: &'a ast::Module) -> Option<(&'a ast::Memory, &'a ast::Value<u32>)> {
-    for section in &module.sections {
+fn get_main_memory<'a>(module: &'a ast::Module) -> Option<(ast::Memory, ast::Value<u32>)> {
+    for section in module.sections.borrow().iter() {
         match section {
             ast::Section::Memory((size, memories)) => {
-                return Some((memories.first().unwrap(), size));
+                return Some((memories.first().unwrap().to_owned(), size.to_owned()));
             }
             _ => {}
         }
     }
 
     None
-}
-
-fn get_code_section<'a>(module: &'a ast::Module) -> Option<(&'a [ast::Code], &'a ast::Value<u32>)> {
-    for section in &module.sections {
-        match section {
-            ast::Section::Code((size, codes)) => {
-                return Some((codes, size));
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
-type VisitorFn = fn(&ast::Value<ast::Instr>, &mut Vec<u8>);
-fn visit_instr(instr: &ast::Value<ast::Instr>, visitor_fn: VisitorFn, input: &mut Vec<u8>) {
-    match &instr.value {
-        ast::Instr::Block(_, body) | ast::Instr::Loop(_, body) | ast::Instr::If(_, body) => {
-            for instr in body {
-                visit_instr(instr, visitor_fn, input);
-            }
-        }
-        _ => visitor_fn(instr, input),
-    }
-}
-
-fn visit_code(code: &ast::Code, visitor_fn: VisitorFn, input: &mut Vec<u8>) {
-    for instr in &code.body {
-        visit_instr(instr, visitor_fn, input);
-    }
 }

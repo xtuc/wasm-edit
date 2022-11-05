@@ -1,5 +1,7 @@
 pub mod ast;
 pub mod parser;
+pub mod printer;
+pub mod traverse;
 
 pub fn update_value<T>(input: &mut Vec<u8>, old_value: &ast::Value<T>, new_value: T) -> usize
 where
@@ -26,27 +28,27 @@ where
 }
 
 pub trait ToBytes {
-    fn to_bytes(self) -> Vec<u8>;
+    fn to_bytes(&self) -> Vec<u8>;
 }
 
 impl ToBytes for u32 {
-    fn to_bytes(self) -> Vec<u8> {
+    fn to_bytes(&self) -> Vec<u8> {
         let mut buffer = Vec::new();
-        leb128::write::unsigned(&mut buffer, self as u64).unwrap();
+        leb128::write::unsigned(&mut buffer, *self as u64).unwrap();
         buffer
     }
 }
 
 impl ToBytes for ast::Instr {
-    fn to_bytes(self) -> Vec<u8> {
+    fn to_bytes(&self) -> Vec<u8> {
         match self {
-            ast::Instr::call(target) => {
+            ast::Instr::call(idx) => {
                 let mut buffer = Vec::new();
                 buffer.push(0x10);
-                leb128::write::unsigned(&mut buffer, target as u64).unwrap();
+                leb128::write::unsigned(&mut buffer, idx.borrow().value as u64).unwrap();
                 buffer
             }
-            _ => unreachable!(),
+            n => todo!("ToBytes not yet implemented for node: {:?}", n),
         }
     }
 }
