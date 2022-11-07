@@ -1,5 +1,6 @@
 use crate::ast;
 use byteorder::{ByteOrder, LittleEndian};
+use log::warn;
 use std::io::Write;
 
 type BoxError = Box<dyn std::error::Error>;
@@ -10,8 +11,8 @@ pub fn print(module: &ast::Module) -> Result<Vec<u8>, BoxError> {
     buffer.write(b"\0asm")?;
     buffer.write(&1u32.to_le_bytes())?;
 
-    for section in module.sections.borrow().iter() {
-        write_section(&mut buffer, section)?;
+    for section in module.sections.lock().unwrap().iter() {
+        write_section(&mut buffer, &section.value)?;
     }
 
     Ok(buffer)
@@ -39,11 +40,11 @@ macro_rules! write_section {
 fn write_section(buffer: &mut Vec<u8>, section: &ast::Section) -> Result<(), BoxError> {
     match section {
         ast::Section::Import((_size, content)) => {
-            write_section!(buffer, content.borrow(), 2, write_section_import);
+            write_section!(buffer, content.lock().unwrap(), 2, write_section_import);
             Ok(())
         }
         ast::Section::Table((_size, content)) => {
-            write_section!(buffer, content.borrow(), 4, write_section_table);
+            write_section!(buffer, content.lock().unwrap(), 4, write_section_table);
             Ok(())
         }
         ast::Section::Memory((_size, content)) => {
@@ -51,11 +52,19 @@ fn write_section(buffer: &mut Vec<u8>, section: &ast::Section) -> Result<(), Box
             Ok(())
         }
         ast::Section::Code((_size, content)) => {
-            write_section!(buffer, content.borrow(), 10, write_section_code);
+            write_section!(buffer, content.lock().unwrap(), 10, write_section_code);
             Ok(())
         }
         ast::Section::Type((_size, content)) => {
-            write_section!(buffer, content.borrow(), 1, write_section_type);
+            write_section!(buffer, content.lock().unwrap(), 1, write_section_type);
+            Ok(())
+        }
+        ast::Section::Element((_size, content)) => {
+            write_section!(buffer, content.lock().unwrap(), 9, write_section_element);
+            Ok(())
+        }
+        ast::Section::Custom((_size, content)) => {
+            write_section!(buffer, content.lock().unwrap(), 0, write_section_custom);
             Ok(())
         }
         ast::Section::Unknown((id, size, content)) => {
@@ -65,11 +74,19 @@ fn write_section(buffer: &mut Vec<u8>, section: &ast::Section) -> Result<(), Box
             Ok(())
         }
         ast::Section::Data((_size, content)) => {
-            write_section!(buffer, content.borrow(), 11, write_section_data);
+            write_section!(buffer, content.lock().unwrap(), 11, write_section_data);
             Ok(())
         }
         ast::Section::Func((_size, content)) => {
-            write_section!(buffer, content.borrow(), 3, write_section_func);
+            write_section!(buffer, content.lock().unwrap(), 3, write_section_func);
+            Ok(())
+        }
+        ast::Section::Export((_size, content)) => {
+            write_section!(buffer, content.lock().unwrap(), 7, write_section_export);
+            Ok(())
+        }
+        ast::Section::Global((_size, content)) => {
+            write_section!(buffer, content.lock().unwrap(), 6, write_section_global);
             Ok(())
         }
     }
@@ -135,6 +152,51 @@ fn write_section_memory(buffer: &mut Vec<u8>, content: &Vec<ast::Memory>) -> Res
     Ok(())
 }
 
+fn write_section_global(buffer: &mut Vec<u8>, content: &Vec<ast::Global>) -> Result<(), BoxError> {
+    write_vec_len(buffer, &content); // vec length
+
+    for global in content {
+        write_value_type(buffer, &global.global_type.valtype);
+        if global.global_type.mutable {
+            buffer.push(0x01);
+        } else {
+            buffer.push(0x00);
+        }
+
+        write_code_expr(buffer, &global.expr.value);
+    }
+
+    Ok(())
+}
+
+fn write_section_export(buffer: &mut Vec<u8>, content: &Vec<ast::Export>) -> Result<(), BoxError> {
+    write_vec_len(buffer, &content); // vec length
+
+    for export in content {
+        write_utf8(buffer, &export.name);
+        match &export.descr {
+            ast::ExportDescr::Func(idx) => {
+                buffer.push(0x00);
+                write_unsigned_leb128(buffer, *idx.lock().unwrap() as u64);
+            }
+            ast::ExportDescr::Table(idx) => {
+                buffer.push(0x01);
+                write_unsigned_leb128(buffer, *idx.lock().unwrap() as u64);
+            }
+            ast::ExportDescr::Mem(idx) => {
+                buffer.push(0x02);
+                write_unsigned_leb128(buffer, *idx.lock().unwrap() as u64);
+            }
+            ast::ExportDescr::Global(idx) => {
+                buffer.push(0x03);
+                write_unsigned_leb128(buffer, *idx.lock().unwrap() as u64);
+            }
+        };
+    }
+
+    Ok(())
+}
+
 fn write_section_func(buffer: &mut Vec<u8>, content: &Vec<u32>) -> Result<(), BoxError> {
     write_vec_len(buffer, &content); // vec length
 
@@ -181,6 +243,45 @@ fn write_section_type(buffer: &mut Vec<u8>, content: &Vec<ast::Type>) -> Result<
     Ok(())
 }
 
+fn write_section_custom(
+    buffer: &mut Vec<u8>,
+    content: &ast::CustomSection,
+) -> Result<(), BoxError> {
+    match content {
+        ast::CustomSection::Unknown(name, bytes) => {
+            write_utf8(buffer, &name);
+            buffer.extend_from_slice(&bytes);
+        }
+        ast::CustomSection::Name(_content) => {
+            warn!("ignoring custom name section.");
+            write_utf8(buffer, "name");
+        }
+    }
+
+    Ok(())
+}
+
+fn write_section_element(
+    buffer: &mut Vec<u8>,
+    content: &Vec<ast::Element>,
+) -> Result<(), BoxError> {
+    write_vec_len(buffer, &content); // vec length
+
+    for t in content {
+        match t {
+            ast::Element::FuncActive(expr, vec) => {
+                buffer.push(0);
+                write_code_expr(buffer, &expr.value);
+                write_vec_len(buffer, &vec.lock().unwrap());
+                for funcidx in vec.lock().unwrap().iter() {
+                    write_unsigned_leb128(buffer, *funcidx as u64);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn write_section_code(
     buffer: &mut Vec<u8>,
     content: &ast::Value<Vec<ast::Code>>,
@@ -192,7 +293,7 @@ fn write_section_code(
         buffer.push(0x0); // func size, going to be fixed.
 
         write_code_local(buffer, &func.locals);
-        write_code_expr(buffer, &func.body.borrow().value);
+        write_code_expr(buffer, &func.body.lock().unwrap().value);
 
         // func size fixup
         {
@@ -236,7 +337,7 @@ fn write_code_expr(buffer: &mut Vec<u8>, expr: &Vec<ast::Value<ast::Instr>>) {
 
         macro_rules! write_instr {
             ($byte:expr, $instr:ident) => {
-                if id == ast::Instr::$instr {
+                if matches!(id, ast::Instr::$instr) {
                     buffer.push($byte);
                     continue;
                 }
@@ -292,7 +393,7 @@ fn write_code_expr(buffer: &mut Vec<u8>, expr: &Vec<ast::Value<ast::Instr>>) {
             ($byte:expr, $instr:ident(MutableValue<u32>)) => {
                 if let ast::Instr::$instr(imm0) = id {
                     buffer.push($byte);
-                    write_unsigned_leb128(buffer, imm0.borrow().value as u64);
+                    write_unsigned_leb128(buffer, imm0.lock().unwrap().value as u64);
                     continue;
                 }
             };
@@ -309,7 +410,7 @@ fn write_code_expr(buffer: &mut Vec<u8>, expr: &Vec<ast::Value<ast::Instr>>) {
             ($byte:expr, $instr:ident(MutableValue<u32>, u32)) => {
                 if let ast::Instr::$instr(imm0, imm1) = id {
                     buffer.push($byte);
-                    let imm0 = imm0.borrow().value;
+                    let imm0 = imm0.lock().unwrap().value;
                     write_unsigned_leb128(buffer, imm0 as u64);
                     write_unsigned_leb128(buffer, imm1 as u64);
                     continue;
@@ -332,25 +433,25 @@ fn write_code_expr(buffer: &mut Vec<u8>, expr: &Vec<ast::Value<ast::Instr>>) {
         write_instr!(0x00, unreachable);
         write_instr!(0x01, nop);
 
-        if let ast::Instr::Block(ret_type, body) = id {
+        if let ast::Instr::Block(ref block_type, body) = id {
             buffer.push(0x02);
-            buffer.push(ret_type);
-            write_code_expr(buffer, &body.borrow().value);
+            write_blocktype(buffer, block_type);
+            write_code_expr(buffer, &body.lock().unwrap().value);
             continue;
         }
 
-        if let ast::Instr::Loop(ret_type, body) = id {
+        if let ast::Instr::Loop(ref block_type, body) = id {
             buffer.push(0x03);
-            buffer.push(ret_type);
-            write_code_expr(buffer, &body.borrow().value);
+            write_blocktype(buffer, block_type);
+            write_code_expr(buffer, &body.lock().unwrap().value);
             continue;
         }
 
-        if let ast::Instr::If(ret_type, body) = id {
+        if let ast::Instr::If(ref block_type, body) = id {
             // FIXME: support IfElse, If will contain both
             buffer.push(0x04);
-            buffer.push(ret_type);
-            write_code_expr(buffer, &body.borrow().value);
+            write_blocktype(buffer, block_type);
+            write_code_expr(buffer, &body.lock().unwrap().value);
             continue;
         }
 
@@ -584,4 +685,18 @@ fn write_float_f32(buffer: &mut Vec<u8>, n: f32) {
     let mut b = [0; 4];
     LittleEndian::write_f32(&mut b, n);
     buffer.extend(b.iter())
+}
+
+fn write_blocktype(buffer: &mut Vec<u8>, block_type: &ast::BlockType) {
+    match block_type {
+        ast::BlockType::Empty => {
+            buffer.push(0x40);
+        }
+        ast::BlockType::ValueType(valtype) => {
+            write_value_type(buffer, valtype);
+        }
+        ast::BlockType::Typeidx(valtype) => {
+            write_signed_leb128(buffer, *valtype as i64);
+        }
+    }
 }

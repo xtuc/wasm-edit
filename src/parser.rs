@@ -1,7 +1,9 @@
 use crate::ast;
+use log::{debug, warn};
 use nom::bytes::complete::take;
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 type BoxError = Box<dyn std::error::Error>;
 
@@ -25,7 +27,7 @@ impl<I> nom::error::ParseError<I> for ParserError {
 
 pub(crate) type IResult<I, O, E = ParserError> = Result<(I, O), nom::Err<E>>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct InputContext<'a> {
     input: &'a [u8],
     offset: usize,
@@ -107,6 +109,11 @@ impl<'a> InputContext<'a> {
             bytes,
         ))
     }
+
+    fn peak_u8(self) -> IResult<InputContext<'a>, u8> {
+        let (_input, byte) = take(1usize)(self.input)?;
+        Ok((self, byte[0]))
+    }
 }
 
 pub fn decode<'a>(input: &'a [u8]) -> Result<ast::Module, BoxError> {
@@ -133,9 +140,18 @@ fn decode_module<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Mo
 
     let mut sections = vec![];
     loop {
+        let start_offset = ctx.offset;
         let res = decode_section(ctx)?;
         ctx = res.0;
-        sections.push(res.1);
+        let end_offset = ctx.offset;
+
+        let value = ast::Value {
+            start_offset,
+            value: res.1,
+            end_offset,
+        };
+
+        sections.push(value);
 
         if ctx.input.is_empty() {
             break;
@@ -143,13 +159,27 @@ fn decode_module<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Mo
     }
 
     let module = ast::Module {
-        sections: Rc::new(RefCell::new(sections)),
+        sections: Arc::new(Mutex::new(sections)),
     };
     Ok((ctx, module))
 }
 
 fn decode_section_memory<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, Vec<ast::Memory>> {
     decode_vec(ctx, decode_memory)
+}
+
+fn decode_section_global<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, Vec<ast::Global>> {
+    decode_vec(ctx, decode_global)
+}
+
+fn decode_section_export<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, Vec<ast::Export>> {
+    decode_vec(ctx, decode_export)
+}
+
+fn decode_section_element<'a>(
+    ctx: InputContext<'a>,
+) -> IResult<InputContext<'a>, Vec<ast::Element>> {
+    decode_vec(ctx, decode_element)
 }
 
 fn decode_section_data<'a>(
@@ -160,6 +190,108 @@ fn decode_section_data<'a>(
 
 fn decode_section_type<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, Vec<ast::Type>> {
     decode_vec(ctx, decode_type)
+}
+
+fn decode_section_custom<'a>(
+    ctx: InputContext<'a>,
+) -> IResult<InputContext<'a>, ast::CustomSection> {
+    let (ctx, name) = decode_name(ctx)?;
+    Ok(match name.as_str() {
+        "name" => {
+            let (ctx, content) = decode_section_custom_name(ctx)?;
+            (ctx, ast::CustomSection::Name(content))
+        }
+        _ => {
+            debug!("unknown custom section: {}", name);
+            (
+                ctx.clone(),
+                ast::CustomSection::Unknown(name, ctx.input.to_vec()),
+            )
+        }
+    })
+}
+
+fn decode_section_custom_name<'a>(
+    ctx: InputContext<'a>,
+) -> IResult<InputContext<'a>, ast::DebugNames> {
+    let module = "unnamed".to_owned();
+    let mut func_names = HashMap::new();
+    let func_local_names = HashMap::new();
+
+    let mut ctx = ctx;
+
+    loop {
+        let ret = ctx.read_u8()?;
+        ctx = ret.0;
+        let subsection = ret.1;
+
+        let ret = ctx.read_leb128()?;
+        ctx = ret.0;
+        let size = ret.1;
+
+        match subsection {
+            // 0 => {
+            //     let ret = decode_name(ctx)?;
+            //     ctx = ret.0;
+            //     module = ret.1;
+            // }
+            1 => {
+                let ret = decode_namemap(ctx)?;
+                ctx = ret.0;
+                func_names = ret.1;
+            }
+            // 2 => {
+            //     let ret = ctx.read_leb128()?;
+            //     ctx = ret.0;
+            //     let n = ret.1;
+
+            //     for i in 0..n {
+            //         let ret = decode_namemap(ctx)?;
+            //         ctx = ret.0;
+            //         func_local_names.insert(i, ret.1);
+            //     }
+            // }
+            _ => {
+                warn!(
+                    "ignoring custom name subsection: {} ({} byte(s))",
+                    subsection, size
+                );
+                let ret = ctx.read_bytes(size as usize)?;
+                ctx = ret.0;
+            }
+        }
+
+        if ctx.input.is_empty() {
+            break;
+        }
+    }
+
+    let debug_names = ast::DebugNames {
+        module,
+        func_names,
+        func_local_names,
+    };
+    Ok((ctx, debug_names))
+}
+
+fn decode_namemap<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, HashMap<u32, String>> {
+    let mut map = HashMap::new();
+
+    let (ctx, n) = ctx.read_leb128()?;
+    let mut ctx = ctx;
+    for _ in 0..n {
+        let ret = ctx.read_leb128()?;
+        ctx = ret.0;
+        let funcidx = ret.1;
+
+        let ret = decode_name(ctx)?;
+        ctx = ret.0;
+        let name = ret.1;
+
+        map.insert(funcidx, name);
+    }
+
+    Ok((ctx, map))
 }
 
 fn decode_section_func<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, Vec<u32>> {
@@ -263,7 +395,7 @@ fn decode_code<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Code
         };
         let (ctx, locals) = decode_vec(ctx, decode_code_local)?;
         let (_ctx, body) = decode_expr(ctx, ast::Instr::end)?;
-        let body = Rc::new(RefCell::new(body));
+        let body = Arc::new(Mutex::new(body));
 
         // Bytes are split before, no need to propagate this context.
         ast::Code { size, locals, body }
@@ -386,7 +518,7 @@ fn decode_instr<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Val
 
                 let value = ast::Value {
                     start_offset,
-                    value: ast::Instr::$instr(Rc::new(RefCell::new(arg0))),
+                    value: ast::Instr::$instr(Arc::new(Mutex::new(arg0))),
                     end_offset,
                 };
                 return Ok((ctx, value));
@@ -413,7 +545,7 @@ fn decode_instr<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Val
                 let start_offset = ctx.offset;
                 let (ctx, arg0) = ctx.read_leb128()?;
                 let end_offset = ctx.offset;
-                let arg0 = Rc::new(RefCell::new(ast::Value {
+                let arg0 = Arc::new(Mutex::new(ast::Value {
                     start_offset,
                     value: arg0,
                     end_offset,
@@ -451,31 +583,31 @@ fn decode_instr<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Val
     decode_instr!(0x01, nop);
 
     if id == 0x02 {
-        let (ctx, ret_type) = ctx.read_u8()?;
+        let (ctx, block_type) = decode_blocktype(ctx)?;
         let (ctx, body) = decode_expr(ctx, ast::Instr::end)?;
         let end_offset = ctx.offset;
 
         let value = ast::Value {
             start_offset,
-            value: ast::Instr::Block(ret_type, Rc::new(RefCell::new(body))),
+            value: ast::Instr::Block(block_type, Arc::new(Mutex::new(body))),
             end_offset,
         };
         return Ok((ctx, value));
     }
     if id == 0x03 {
-        let (ctx, ret_type) = ctx.read_u8()?;
+        let (ctx, block_type) = decode_blocktype(ctx)?;
         let (ctx, body) = decode_expr(ctx, ast::Instr::end)?;
         let end_offset = ctx.offset;
 
         let value = ast::Value {
             start_offset,
-            value: ast::Instr::Loop(ret_type, Rc::new(RefCell::new(body))),
+            value: ast::Instr::Loop(block_type, Arc::new(Mutex::new(body))),
             end_offset,
         };
         return Ok((ctx, value));
     }
     if id == 0x04 {
-        let (ctx, ret_type) = ctx.read_u8()?;
+        let (ctx, block_type) = decode_blocktype(ctx)?;
         // let (ctx, consequent) = decode_expr(ctx, ast::Instr::else_end)?;
         // FIXME: support IfElse, If will contain both
         let (ctx, body) = decode_expr(ctx, ast::Instr::end)?;
@@ -483,7 +615,7 @@ fn decode_instr<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Val
 
         let value = ast::Value {
             start_offset,
-            value: ast::Instr::If(ret_type, Rc::new(RefCell::new(body))),
+            value: ast::Instr::If(block_type, Arc::new(Mutex::new(body))),
             end_offset,
         };
         return Ok((ctx, value));
@@ -687,8 +819,8 @@ fn decode_instr<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Val
 
 fn decode_expr<'a>(
     ctx: InputContext<'a>,
-    end_instr: ast::Instr,
-) -> IResult<InputContext<'a>, ast::Value<Vec<ast::Value<ast::Instr>>>> {
+    _end_instr: ast::Instr,
+) -> IResult<InputContext<'a>, ast::Expr> {
     let start_offset = ctx.offset;
 
     let mut ctx = ctx;
@@ -697,7 +829,7 @@ fn decode_expr<'a>(
         let ret = decode_instr(ctx)?;
         ctx = ret.0;
         vec.push(ret.1.clone());
-        if ret.1.value == end_instr {
+        if matches!(ret.1.value, ast::Instr::end) {
             break;
         }
     }
@@ -761,6 +893,70 @@ fn decode_data<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Data
     }
 }
 
+fn decode_element<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Element> {
+    let (ctx, t) = ctx.read_leb128()?;
+    Ok(match t {
+        0 => {
+            let (ctx, expr) = decode_expr(ctx, ast::Instr::end)?;
+            let (ctx, elements) = decode_vec(ctx, |ctx| ctx.read_leb128())?;
+            (
+                ctx,
+                ast::Element::FuncActive(expr, Arc::new(Mutex::new(elements))),
+            )
+        }
+        _ => unimplemented!("element segment of type: {}", t),
+    })
+}
+
+fn decode_export<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Export> {
+    let (ctx, name) = decode_name(ctx)?;
+    let (ctx, descr) = decode_export_desc(ctx)?;
+    let export = ast::Export { name, descr };
+    Ok((ctx, export))
+}
+
+fn decode_export_desc<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::ExportDescr> {
+    let (ctx, t) = ctx.read_u8()?;
+    Ok(match t {
+        0x00 => {
+            let (ctx, idx) = ctx.read_leb128()?;
+            (ctx, ast::ExportDescr::Func(Arc::new(Mutex::new(idx))))
+        }
+        0x01 => {
+            let (ctx, idx) = ctx.read_leb128()?;
+            (ctx, ast::ExportDescr::Table(Arc::new(Mutex::new(idx))))
+        }
+        0x02 => {
+            let (ctx, idx) = ctx.read_leb128()?;
+            (ctx, ast::ExportDescr::Mem(Arc::new(Mutex::new(idx))))
+        }
+        0x03 => {
+            let (ctx, idx) = ctx.read_leb128()?;
+            (ctx, ast::ExportDescr::Global(Arc::new(Mutex::new(idx))))
+        }
+        _ => unimplemented!("unsupported export descr"),
+    })
+}
+
+fn decode_global<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Global> {
+    let (ctx, global_type) = decode_global_type(ctx)?;
+    let (ctx, expr) = decode_expr(ctx, ast::Instr::end)?;
+    let global = ast::Global { global_type, expr };
+    Ok((ctx, global))
+}
+
+fn decode_global_type<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::GlobalType> {
+    let (ctx, valtype) = decode_valtype(ctx)?;
+    let (ctx, mutable) = ctx.read_u8()?;
+
+    let global_type = ast::GlobalType {
+        valtype,
+        mutable: mutable == 1,
+    };
+
+    Ok((ctx, global_type))
+}
+
 fn decode_memory<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Memory> {
     let (ctx, t) = ctx.read_u8()?;
 
@@ -803,24 +999,43 @@ fn decode_section<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::S
     };
 
     let section = match id {
+        0 => {
+            let (_, res) = decode_section_custom(section_bytes)?;
+            ast::Section::Custom((section_size, Arc::new(Mutex::new(res))))
+        }
+        1 => {
+            let (_, res) = decode_section_type(section_bytes)?;
+            ast::Section::Type((section_size, Arc::new(Mutex::new(res))))
+        }
         2 => {
             let (_, res) = decode_section_import(section_bytes)?;
-            ast::Section::Import((section_size, Rc::new(RefCell::new(res))))
+            ast::Section::Import((section_size, Arc::new(Mutex::new(res))))
         }
         3 => {
             let (_, res) = decode_section_func(section_bytes)?;
-            ast::Section::Func((section_size, Rc::new(RefCell::new(res))))
+            ast::Section::Func((section_size, Arc::new(Mutex::new(res))))
         }
         4 => {
             let (_, res) = decode_section_table(section_bytes)?;
-            ast::Section::Table((section_size, Rc::new(RefCell::new(res))))
+            ast::Section::Table((section_size, Arc::new(Mutex::new(res))))
         }
         5 => {
             let (_, res) = decode_section_memory(section_bytes)?;
             ast::Section::Memory((section_size, res))
         }
+        6 => {
+            let (_, res) = decode_section_global(section_bytes)?;
+            ast::Section::Global((section_size, Arc::new(Mutex::new(res))))
+        }
+        7 => {
+            let (_, res) = decode_section_export(section_bytes)?;
+            ast::Section::Export((section_size, Arc::new(Mutex::new(res))))
+        }
+        9 => {
+            let (_, res) = decode_section_element(section_bytes)?;
+            ast::Section::Element((section_size, Arc::new(Mutex::new(res))))
+        }
         10 => {
-            let start_offset = ctx.offset;
             let (_, res) = decode_section_code(section_bytes)?;
             let end_offset = ctx.offset;
 
@@ -829,17 +1044,16 @@ fn decode_section<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::S
                 value: res,
                 end_offset,
             };
-            ast::Section::Code((section_size, Rc::new(RefCell::new(value))))
+            ast::Section::Code((section_size, Arc::new(Mutex::new(value))))
         }
         11 => {
             let (_, res) = decode_section_data(section_bytes)?;
-            ast::Section::Data((section_size, Rc::new(RefCell::new(res))))
+            ast::Section::Data((section_size, Arc::new(Mutex::new(res))))
         }
-        1 => {
-            let (_, res) = decode_section_type(section_bytes)?;
-            ast::Section::Type((section_size, Rc::new(RefCell::new(res))))
+        id => {
+            warn!("unknown section with id {}", id);
+            ast::Section::Unknown((id, size, section_bytes.input.to_vec()))
         }
-        id => ast::Section::Unknown((id, size, section_bytes.input.to_vec())),
     };
     Ok((ctx, section))
 }
@@ -861,4 +1075,20 @@ pub(crate) fn decode_vec<'a, T>(
     }
 
     Ok((ctx, items))
+}
+
+fn decode_blocktype<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::BlockType> {
+    let (ctx, next) = ctx.peak_u8()?;
+    if next == 0x40 {
+        // actually read what we peaked
+        let (ctx, _) = ctx.read_u8()?;
+        Ok((ctx, ast::BlockType::Empty))
+    } else {
+        if let Ok((ctx, valtype)) = decode_valtype(ctx.clone()) {
+            Ok((ctx, ast::BlockType::ValueType(valtype)))
+        } else {
+            let (ctx, typeidx) = ctx.read_leb128()?;
+            Ok((ctx, ast::BlockType::Typeidx(typeidx)))
+        }
+    }
 }
