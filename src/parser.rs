@@ -221,6 +221,9 @@ fn decode_section_custom_name<'a>(
     let mut ctx = ctx;
 
     loop {
+        if ctx.input.is_empty() {
+            break;
+        }
         let ret = ctx.read_u8()?;
         ctx = ret.0;
         let subsection = ret.1;
@@ -228,6 +231,8 @@ fn decode_section_custom_name<'a>(
         let ret = ctx.read_leb128()?;
         ctx = ret.0;
         let size = ret.1;
+
+        debug!("parsing name subsection: {}", subsection);
 
         match subsection {
             // 0 => {
@@ -259,10 +264,6 @@ fn decode_section_custom_name<'a>(
                 let ret = ctx.read_bytes(size as usize)?;
                 ctx = ret.0;
             }
-        }
-
-        if ctx.input.is_empty() {
-            break;
         }
     }
 
@@ -984,6 +985,8 @@ fn decode_section<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::S
     let (ctx, size) = ctx.read_leb128()?;
     let end_offset = ctx.offset;
 
+    debug!("decoding section {} ({} byte(s))", id, size);
+
     let section_size = ast::Value {
         start_offset,
         value: size,
@@ -999,10 +1002,13 @@ fn decode_section<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::S
     };
 
     let section = match id {
-        0 => {
-            let (_, res) = decode_section_custom(section_bytes)?;
-            ast::Section::Custom((section_size, Arc::new(Mutex::new(res))))
-        }
+        0 => match decode_section_custom(section_bytes.clone()) {
+            Ok((_, res)) => ast::Section::Custom((section_size, Arc::new(Mutex::new(res)))),
+            Err(err) => {
+                warn!("failed to parse custom section: {}. Ignoring.", err);
+                ast::Section::Unknown((id, size, section_bytes.input.to_vec()))
+            }
+        },
         1 => {
             let (_, res) = decode_section_type(section_bytes)?;
             ast::Section::Type((section_size, Arc::new(Mutex::new(res))))
