@@ -1,40 +1,328 @@
 use crate::ast;
 use log::debug;
-use std::rc::Rc;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
+use threadpool::ThreadPool;
 
-fn prepend<T>(v: Vec<T>, s: &[T]) -> Vec<T>
-where
-    T: Clone,
-{
-    let mut tmp: Vec<_> = s.to_owned();
-    tmp.extend(v);
-    tmp
-}
+pub fn locals_flatten(locals: Vec<ast::CodeLocal>) -> Vec<ast::CodeLocal> {
+    let mut out = Vec::new();
 
-pub struct VisitorContext<'a, T> {
-    insert_nodes_after: Vec<T>,
-    insert_nodes_before: Vec<T>,
-    replace_node: Option<T>,
-    insert_new_section: Option<ast::Section>,
-    pub curr_funcidx: Option<u32>,
-    pub node: &'a T,
-}
-impl<'a, T> VisitorContext<'a, T> {
-    pub fn new(node: &'a T) -> Self {
-        Self {
-            node,
-            insert_nodes_after: vec![],
-            insert_nodes_before: vec![],
-            insert_new_section: None,
-            replace_node: None,
-            curr_funcidx: None,
+    for local in locals {
+        for _ in 0..local.count {
+            out.push(ast::CodeLocal {
+                count: 1,
+                value_type: local.value_type.clone(),
+            });
         }
+    }
+
+    out
+}
+
+pub struct WasmModule {
+    pub inner: Arc<ast::Module>,
+    types: Mutex<HashMap<u32, ast::Type>>,
+    /// Mapping between funcidx and count of func locals
+    func_locals: HashMap<u32, Vec<ast::CodeLocal>>,
+    func_to_typeidx: Mutex<Vec<u32>>,
+    func_starts: HashMap<u32, usize>,
+    imports: Vec<ast::Import>,
+    exports: Vec<ast::Export>,
+}
+impl WasmModule {
+    pub fn new(inner: Arc<ast::Module>) -> Self {
+        let mut types = HashMap::new();
+        let mut func_locals = HashMap::new();
+        let mut func_to_typeidx = Vec::new();
+        let mut imports = Vec::new();
+        let mut exports = Vec::new();
+        let mut func_starts = HashMap::new();
+
+        for section in inner.sections.lock().unwrap().iter() {
+            match &section.value {
+                ast::Section::Type((_size, content)) => {
+                    let mut typeidx = 0;
+                    for t in &*content.lock().unwrap() {
+                        types.insert(typeidx, t.to_owned());
+                        typeidx += 1;
+                    }
+                }
+
+                ast::Section::Import((_size, content)) => {
+                    imports = content.lock().unwrap().clone();
+                }
+
+                ast::Section::Func((_size, content)) => {
+                    func_to_typeidx = content.lock().unwrap().clone();
+                }
+
+                ast::Section::Export((_section_size, content)) => {
+                    exports = content.lock().unwrap().clone();
+                }
+
+                ast::Section::Code((_section_size, content)) => {
+                    let mut funcidx = imports.len() as u32;
+
+                    for c in &content.lock().unwrap().value {
+                        func_starts.insert(funcidx as u32, c.body.lock().unwrap().start_offset);
+                        func_locals.insert(funcidx, c.locals.clone());
+                        funcidx += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Self {
+            inner,
+            imports,
+            exports,
+            func_locals,
+            func_starts,
+            types: Mutex::new(types),
+            func_to_typeidx: Mutex::new(func_to_typeidx),
+        }
+    }
+
+    pub fn add_data(&self, offset: u32, bytes: &[u8]) -> (u32, u32) {
+        for section in self.inner.sections.lock().unwrap().iter() {
+            match &section.value {
+                ast::Section::Data((_section_size, content)) => {
+                    let segment = ast::DataSegment {
+                        offset: ast::Value::new(vec![
+                            ast::Value::new(ast::Instr::i32_const(offset as i64)),
+                            ast::Value::new(ast::Instr::end),
+                        ]),
+                        bytes: bytes.to_vec(),
+                    };
+                    content.lock().unwrap().push(segment);
+                }
+                _ => {}
+            }
+        }
+
+        (offset, offset + bytes.len() as u32)
+    }
+
+    pub fn is_func_imported(&self, funcidx: u32) -> bool {
+        (funcidx as usize) < self.imports.len()
+    }
+
+    pub fn func_locals_count(&self, funcidx: u32) -> u32 {
+        let locals = self.func_locals(funcidx);
+        let mut count = 0;
+        for local in locals {
+            count += local.count;
+        }
+
+        count
+    }
+
+    pub fn func_locals(&self, funcidx: u32) -> Vec<ast::CodeLocal> {
+        let locals = self
+            .func_locals
+            .get(&funcidx)
+            .expect(&format!("locals for funcidx {}", funcidx));
+        locals.to_owned()
+    }
+
+    pub fn is_func_exported(&self, funcidx: u32) -> bool {
+        for export in &self.exports {
+            match &export.descr {
+                ast::ExportDescr::Func(f) => {
+                    if *f.lock().unwrap() == funcidx {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        false
+    }
+
+    /// Retrieve the type of a function,
+    /// note that this doesn't work for imported functions as they
+    /// have their type expressed differently.
+    pub fn get_func_type(&self, funcidx: u32) -> ast::Type {
+        let typeidx = self.get_func_typeidx(funcidx);
+        let types = self.types.lock().unwrap();
+        types.get(&typeidx).expect("type not found").clone()
+    }
+
+    pub fn get_func_typeidx(&self, funcidx: u32) -> u32 {
+        let func_to_typeidx = self.func_to_typeidx.lock().unwrap();
+
+        if (funcidx as usize) < self.imports.len() {
+            // Func is an imported function
+            let import = &self.imports[funcidx as usize];
+            import.typeidx
+        } else {
+            // Func is an implemented function
+            let funcidx = funcidx as usize - self.imports.len();
+
+            *func_to_typeidx
+                .get(funcidx as usize)
+                .expect(&format!("type not found for funcidx: {}", funcidx))
+        }
+    }
+
+    pub fn get_code_section_start_offset(&self) -> Option<usize> {
+        for section in self.inner.sections.lock().unwrap().iter() {
+            match &section.value {
+                ast::Section::Code(_) => return Some(section.start_offset),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    pub fn get_start_of_func(&self, funcidx: u32) -> Option<usize> {
+        if let Some(start) = self.func_starts.get(&funcidx) {
+            Some(*start)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_custom_section(&self, name: &str) -> Option<Vec<u8>> {
+        for section in self.inner.sections.lock().unwrap().iter() {
+            match &section.value {
+                ast::Section::Custom((_size, section)) => match &*section.lock().unwrap() {
+                    ast::CustomSection::Unknown(section_name, bytes) => {
+                        if section_name == name {
+                            return Some(bytes.to_owned());
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+
+        None
+    }
+
+    pub fn get_func_name(&self, funcidx: u32) -> Option<String> {
+        for section in self.inner.sections.lock().unwrap().iter() {
+            match &section.value {
+                ast::Section::Custom((_size, section)) => match &*section.lock().unwrap() {
+                    ast::CustomSection::Name(names) => {
+                        if let Some(name) = names.func_names.get(&funcidx) {
+                            return Some(name.clone());
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+
+        None
+    }
+
+    pub fn find_import(&self, name: &str) -> u32 {
+        let mut funcidx = 0;
+        for section in self.inner.sections.lock().unwrap().iter() {
+            match &section.value {
+                ast::Section::Import((_section_size, content)) => {
+                    for import in &*content.lock().unwrap() {
+                        if import.name == name {
+                            return funcidx;
+                        }
+                        funcidx += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        0
+    }
+
+    pub fn add_import(&self, _import: &ast::Import) -> u32 {
+        unimplemented!("Adding an import requires to shifts all references to functions by one, which is unsafe (func tables) or inconvenient (name section).");
+    }
+
+    pub fn add_global(&self, global: &ast::Global) -> Option<u32> {
+        for section in self.inner.sections.lock().unwrap().iter() {
+            match &section.value {
+                ast::Section::Global((_section_size, content)) => {
+                    let globalidx = content.lock().unwrap().len() as u32;
+                    content.lock().unwrap().push(global.to_owned());
+                    return Some(globalidx);
+                }
+                _ => {}
+            }
+        }
+
+        None
+    }
+
+    pub fn add_function(&self, func: &ast::Code, typeidx: u32) -> u32 {
+        let mut funcidx = 0;
+
+        for section in self.inner.sections.lock().unwrap().iter() {
+            match &section.value {
+                ast::Section::Import((_section_size, content)) => {
+                    // TODO: why count Import and not Func section?
+                    funcidx += content.lock().unwrap().len() as u32;
+                }
+                ast::Section::Code((_section_size, content)) => {
+                    funcidx += content.lock().unwrap().value.len() as u32;
+                    content.lock().unwrap().value.push(func.to_owned());
+                }
+                ast::Section::Func((_section_size, content)) => {
+                    content.lock().unwrap().push(typeidx);
+                }
+                _ => {}
+            }
+        }
+
+        self.func_to_typeidx.lock().unwrap().push(typeidx);
+        funcidx
+    }
+
+    pub fn add_type(&self, t: &ast::Type) -> u32 {
+        let mut typeidx = 0;
+
+        for section in self.inner.sections.lock().unwrap().iter() {
+            match &section.value {
+                ast::Section::Type((_section_size, content)) => {
+                    typeidx = content.lock().unwrap().len() as u32;
+                    content.lock().unwrap().push(t.clone());
+
+                    self.types.lock().unwrap().insert(typeidx, t.to_owned());
+                }
+                _ => {}
+            }
+        }
+
+        typeidx
     }
 }
 
-impl<'a> VisitorContext<'a, ast::Module> {
-    pub fn insert_new_section(&mut self, new_node: ast::Section) {
-        self.insert_new_section = Some(new_node);
+pub struct VisitorContext<'a, T> {
+    pub module: Arc<WasmModule>,
+    insert_nodes_after: Vec<T>,
+    insert_nodes_before: Vec<T>,
+    replace_node: Option<T>,
+    pub curr_funcidx: Option<u32>,
+    pub node: &'a T,
+    traverse_stop: bool,
+}
+impl<'a, T> VisitorContext<'a, T> {
+    pub fn new(module: Arc<WasmModule>, node: &'a T) -> Self {
+        Self {
+            node,
+            module,
+            insert_nodes_after: vec![],
+            insert_nodes_before: vec![],
+            replace_node: None,
+            curr_funcidx: None,
+            traverse_stop: false,
+        }
     }
 }
 
@@ -49,6 +337,10 @@ impl<'a, T> VisitorContext<'a, Vec<T>> {
 }
 
 impl<'a> VisitorContext<'a, ast::Value<ast::Instr>> {
+    pub fn stop_traversal(&mut self) {
+        self.traverse_stop = true;
+    }
+
     pub fn insert_node_after(&mut self, new_node: ast::Instr) {
         self.insert_nodes_after.push(ast::Value::new(new_node));
     }
@@ -64,84 +356,98 @@ impl<'a> VisitorContext<'a, ast::Value<ast::Instr>> {
 
 pub trait Visitor {
     fn visit_instr<'a>(&self, _ctx: &'_ mut VisitorContext<'a, ast::Value<ast::Instr>>) {}
-    fn visit_func<'a>(&self, _ctx: &'_ mut VisitorContext<'a, ast::Code>) {}
-    fn visit_module<'a>(&self, _ctx: &'_ mut VisitorContext<'a, ast::Module>) {}
+    fn visit_type<'a>(&self, _ctx: &'_ mut VisitorContext<'a, ast::Type>, _typeidx: u32) {}
     fn visit_code_section<'a>(&self, _ctx: &'_ mut VisitorContext<'a, Vec<ast::Code>>) {}
-    fn visit_type_section<'a>(&self, _ctx: &'_ mut VisitorContext<'a, Vec<ast::Type>>) {}
     fn visit_import_section<'a>(&self, _ctx: &'_ mut VisitorContext<'a, Vec<ast::Import>>) {}
     fn visit_func_section<'a>(&self, _ctx: &'_ mut VisitorContext<'a, Vec<u32>>) {}
     fn visit_data_section<'a>(&self, _ctx: &'_ mut VisitorContext<'a, Vec<ast::DataSegment>>) {}
+    fn visit_table<'a>(&self, _ctx: &'_ mut VisitorContext<'a, ast::Table>) {}
+    fn visit_export<'a>(&self, _ctx: &'_ mut VisitorContext<'a, ast::Export>) {}
+    fn visit_element<'a>(&self, _ctx: &'_ mut VisitorContext<'a, ast::Element>) {}
 }
 
-pub fn traverse(module: &ast::Module, visitor: Rc<dyn Visitor>) {
-    {
-        let mut ctx = VisitorContext::new(module);
-        Rc::clone(&visitor).visit_module(&mut ctx);
-        assert!(ctx.insert_nodes_before.is_empty());
-        assert!(ctx.insert_nodes_after.is_empty());
-
-        if let Some(new_section) = ctx.insert_new_section {
-            debug!("insert new section: {:?}", new_section);
-            module.sections.borrow_mut().push(new_section);
-        }
-    }
+pub fn traverse(module: Arc<ast::Module>, visitor: Arc<dyn Visitor + Send + Sync>) {
+    let pool = ThreadPool::new(num_cpus::get());
 
     let mut curr_funcidx = 0;
 
-    for section in module.sections.borrow().iter() {
-        match section {
+    let module_ast = Arc::new(WasmModule::new(Arc::clone(&module)));
+
+    for section in module.sections.lock().unwrap().iter() {
+        match &section.value {
             ast::Section::Func((_section_size, funcs)) => {
-                let nodes = funcs.borrow().clone();
-                let mut ctx = VisitorContext::new(&nodes);
-                Rc::clone(&visitor).visit_func_section(&mut ctx);
+                let nodes = funcs.lock().unwrap().clone();
+                let mut ctx = VisitorContext::new(Arc::clone(&module_ast), &nodes);
+                Arc::clone(&visitor).visit_func_section(&mut ctx);
                 assert!(ctx.insert_nodes_before.is_empty());
-
-                let mut new_nodes = ctx.insert_nodes_after;
-                new_nodes.reverse();
-
-                for new_node in new_nodes {
-                    debug!("inject new func: {:?}", new_node);
-                    funcs.borrow_mut().extend_from_slice(&new_node);
-                }
-            }
-            ast::Section::Type((_section_size, types)) => {
-                let nodes = types.borrow().clone();
-                let mut ctx = VisitorContext::new(&nodes);
-                Rc::clone(&visitor).visit_type_section(&mut ctx);
-                assert!(ctx.insert_nodes_before.is_empty());
-
-                let mut new_nodes = ctx.insert_nodes_after;
-                new_nodes.reverse();
-
-                for new_node in new_nodes {
-                    debug!("inject new type: {:?}", new_node);
-                    types.borrow_mut().extend_from_slice(&new_node);
-                }
-            }
-            ast::Section::Import((_section_size, content)) => {
-                let nodes = content.borrow().clone();
-                let mut ctx = VisitorContext::new(&nodes);
-                Rc::clone(&visitor).visit_import_section(&mut ctx);
-                assert!(ctx.insert_nodes_after.is_empty());
 
                 {
-                    let mut new_nodes = ctx.insert_nodes_before;
+                    let mut new_nodes = ctx.insert_nodes_after;
                     new_nodes.reverse();
 
                     for new_node in new_nodes {
+                        debug!("inject new func: {:?}", new_node);
+                        funcs.lock().unwrap().extend_from_slice(&new_node);
+                    }
+                }
+            }
+            ast::Section::Export((_section_size, exports)) => {
+                for export in exports.lock().unwrap().iter() {
+                    let mut ctx = VisitorContext::new(Arc::clone(&module_ast), export);
+                    visitor.visit_export(&mut ctx);
+                    assert!(ctx.insert_nodes_before.is_empty());
+                    assert!(ctx.insert_nodes_after.is_empty());
+                }
+            }
+            ast::Section::Element((_section_size, elements)) => {
+                for element in elements.lock().unwrap().iter() {
+                    let mut ctx = VisitorContext::new(Arc::clone(&module_ast), element);
+                    visitor.visit_element(&mut ctx);
+                    assert!(ctx.insert_nodes_before.is_empty());
+                    assert!(ctx.insert_nodes_after.is_empty());
+                }
+            }
+            ast::Section::Table((_section_size, tables)) => {
+                let module_ast = Arc::clone(&module_ast);
+                for table in tables.lock().unwrap().iter() {
+                    let mut ctx = VisitorContext::new(Arc::clone(&module_ast), table);
+                    visitor.visit_table(&mut ctx);
+                    assert!(ctx.insert_nodes_before.is_empty());
+                    assert!(ctx.insert_nodes_after.is_empty());
+                }
+            }
+            ast::Section::Type((_section_size, types)) => {
+                let mut typeidx = 0;
+                let types_copy = types.lock().unwrap().clone();
+                for t in types_copy {
+                    let mut ctx = VisitorContext::new(Arc::clone(&module_ast), &t);
+                    visitor.visit_type(&mut ctx, typeidx);
+                    typeidx += 1;
+
+                    assert!(ctx.insert_nodes_before.is_empty());
+                    assert!(ctx.insert_nodes_after.is_empty());
+                }
+            }
+            ast::Section::Import((_section_size, content)) => {
+                let nodes = content.lock().unwrap().clone();
+                let mut ctx = VisitorContext::new(Arc::clone(&module_ast), &nodes);
+                Arc::clone(&visitor).visit_import_section(&mut ctx);
+                assert!(ctx.insert_nodes_before.is_empty());
+
+                {
+                    for new_node in ctx.insert_nodes_after {
                         debug!("inject new import: {:?}", new_node);
-                        let new = prepend(new_node, &content.borrow().clone());
-                        *content.borrow_mut() = new;
+                        content.lock().unwrap().extend_from_slice(&new_node);
                     }
                 }
 
-                curr_funcidx += content.borrow().len() as u32;
+                curr_funcidx += content.lock().unwrap().len() as u32;
             }
             ast::Section::Code((_section_size, codes)) => {
                 {
-                    let nodes = codes.borrow().clone().value;
-                    let mut ctx = VisitorContext::new(&nodes);
-                    Rc::clone(&visitor).visit_code_section(&mut ctx);
+                    let nodes = codes.lock().unwrap().clone().value;
+                    let mut ctx = VisitorContext::new(Arc::clone(&module_ast), &nodes);
+                    Arc::clone(&visitor).visit_code_section(&mut ctx);
                     assert!(ctx.insert_nodes_before.is_empty());
 
                     let mut new_nodes = ctx.insert_nodes_after;
@@ -149,28 +455,32 @@ pub fn traverse(module: &ast::Module, visitor: Rc<dyn Visitor>) {
 
                     for new_node in new_nodes {
                         debug!("inject new code: {:?}", new_node);
-                        codes.borrow_mut().value.extend_from_slice(&new_node);
+                        codes.lock().unwrap().value.extend_from_slice(&new_node);
                     }
                 }
 
-                for code in codes.borrow().value.iter() {
+                let codes = codes.lock().unwrap().clone();
+                for code in codes.value {
                     {
-                        let mut ctx = VisitorContext::new(code);
-                        Rc::clone(&visitor).visit_func(&mut ctx);
-
-                        assert!(ctx.insert_nodes_before.is_empty());
-                        assert!(ctx.insert_nodes_after.is_empty());
+                        let visitor = Arc::clone(&visitor);
+                        let module_ast = Arc::clone(&module_ast);
+                        pool.execute(move || {
+                            visit_expr(
+                                Arc::clone(&module_ast),
+                                Arc::clone(&code.body),
+                                Arc::clone(&visitor),
+                                curr_funcidx,
+                            );
+                        });
                     }
-
-                    visit_expr(Rc::clone(&code.body), Rc::clone(&visitor), curr_funcidx);
 
                     curr_funcidx += 1;
                 }
             }
             ast::Section::Data((_section_size, segments)) => {
-                let nodes = segments.borrow().clone();
-                let mut ctx = VisitorContext::new(&nodes);
-                Rc::clone(&visitor).visit_data_section(&mut ctx);
+                let nodes = segments.lock().unwrap().clone();
+                let mut ctx = VisitorContext::new(Arc::clone(&module_ast), &nodes);
+                Arc::clone(&visitor).visit_data_section(&mut ctx);
                 assert!(ctx.insert_nodes_before.is_empty());
 
                 let mut new_nodes = ctx.insert_nodes_after;
@@ -178,57 +488,69 @@ pub fn traverse(module: &ast::Module, visitor: Rc<dyn Visitor>) {
 
                 for new_node in new_nodes {
                     debug!("inject new data: {:?}", new_node);
-                    segments.borrow_mut().extend_from_slice(&new_node);
+                    segments.lock().unwrap().extend_from_slice(&new_node);
                 }
             }
             _ => {}
         }
     }
+
+    // TODO: add barrier
+    pool.join();
 }
 
 fn visit_expr(
+    module_ast: Arc<WasmModule>,
     expr: ast::MutableValue<Vec<ast::Value<ast::Instr>>>,
-    visitor: Rc<dyn Visitor>,
+    visitor: Arc<dyn Visitor + Send + Sync>,
     curr_funcidx: u32,
 ) {
-    let expr_copy = expr.borrow().clone();
+    let expr_copy = expr.lock().unwrap().clone();
+
+    // Keep track of many nodes we injected since we started iterating, so that
+    // subsequent inserts are at the right place.
+    // The iterator is a copy of the array of nodes.
+    let mut added = 0;
 
     for i in 0..expr_copy.value.len() {
         let instr = expr_copy.value[i].clone();
         if let ast::Instr::Block(_, body) = instr.value {
-            visit_expr(body, visitor.clone(), curr_funcidx);
+            visit_expr(Arc::clone(&module_ast), body, visitor.clone(), curr_funcidx);
         } else if let ast::Instr::If(_, body) = instr.value {
-            visit_expr(body, visitor.clone(), curr_funcidx);
+            visit_expr(Arc::clone(&module_ast), body, visitor.clone(), curr_funcidx);
         } else if let ast::Instr::Loop(_, body) = instr.value {
-            visit_expr(body, visitor.clone(), curr_funcidx);
+            visit_expr(Arc::clone(&module_ast), body, visitor.clone(), curr_funcidx);
         } else {
-            let mut ctx = VisitorContext::new(&instr);
+            let mut ctx = VisitorContext::new(Arc::clone(&module_ast), &instr);
             ctx.curr_funcidx = Some(curr_funcidx);
             visitor.visit_instr(&mut ctx);
 
             if let Some(replace_node) = ctx.replace_node {
                 debug!("replace instr: {:?}", replace_node);
-                expr.borrow_mut().value[i] = replace_node;
+                expr.lock().unwrap().value[i + added] = replace_node;
             }
 
-            {
-                let mut new_nodes = ctx.insert_nodes_after;
-                new_nodes.reverse();
-
-                for new_node in new_nodes {
-                    debug!("insert instr: {:?}", new_node);
-                    expr.borrow_mut().value.insert(i + 1, new_node);
-                }
+            if ctx.insert_nodes_after.len() > 0 {
+                debug!("insert instr(s): {:?}", ctx.insert_nodes_after);
+                expr.lock().unwrap().value.splice(
+                    (i + added + 1)..(i + added + 1),
+                    ctx.insert_nodes_after.clone(),
+                );
+                added += ctx.insert_nodes_after.len();
             }
 
-            {
-                let mut new_nodes = ctx.insert_nodes_before;
-                new_nodes.reverse();
+            if ctx.insert_nodes_before.len() > 0 {
+                debug!("insert instr(s): {:?}", ctx.insert_nodes_before);
 
-                for new_node in new_nodes {
-                    debug!("insert instr: {:?}", new_node);
-                    expr.borrow_mut().value.insert(i, new_node);
-                }
+                expr.lock()
+                    .unwrap()
+                    .value
+                    .splice((i + added)..(i + added), ctx.insert_nodes_before.clone());
+                added += ctx.insert_nodes_before.len();
+            }
+
+            if ctx.traverse_stop {
+                break;
             }
         }
     }

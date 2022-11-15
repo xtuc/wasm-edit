@@ -2,8 +2,69 @@
 // Allow non camel case types because it's easier to copy paste from the
 // Wasm reference interpreter.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+#[macro_export]
+macro_rules! body {
+    ($( $v:expr ),*) => {{
+        let mut body = vec![];
+        $(
+            body.extend_from_slice(&$v);
+        )*
+        body.push(ast::Value::new(ast::Instr::end));
+        ast::Value::new(body)
+    }};
+}
+
+#[macro_export]
+macro_rules! make_type {
+    {} => {
+        ast::Type {
+            params: vec![],
+            results: vec![],
+        }
+    };
+
+    {($( $arg:ident ),*) -> ()} => {{
+        use ast::NumType::*;
+
+        let mut t = ast::Type {
+            params: vec![],
+            results: vec![],
+        };
+        $(
+            t.params.push(ast::ValueType::NumType($arg));
+        )*;
+
+        t
+    }};
+
+    {($( $arg:ident ),*) -> $res:ident} => {{
+        use ast::NumType::*;
+
+        let mut t = ast::Type {
+            params: vec![],
+            results: vec![ast::ValueType::NumType($res)],
+        };
+        $(
+            t.params.push(ast::ValueType::NumType($arg));
+        )*;
+
+        t
+    }};
+}
+pub use body;
+pub use make_type;
+
+#[macro_export]
+macro_rules! make_value {
+    ($v:expr) => {
+        Arc::new(Mutex::new(ast::Value::new($v)))
+    };
+}
+pub use make_value;
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Value<T> {
@@ -21,7 +82,7 @@ impl<T> Value<T> {
     }
 }
 
-pub type MutableValue<T> = Rc<RefCell<Value<T>>>;
+pub type MutableValue<T> = Arc<Mutex<Value<T>>>;
 
 #[derive(Debug, Clone)]
 pub struct Memory {
@@ -41,14 +102,14 @@ pub struct CodeLocal {
     pub value_type: ValueType,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum ValueType {
     NumType(NumType),
     // VectorType(),
     // RefType(),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum NumType {
     I32,
     I64,
@@ -94,6 +155,13 @@ impl DataSegment {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub enum BlockType {
+    Empty,
+    ValueType(ValueType),
+    Typeidx(u32),
+}
+
+#[derive(Debug, Clone)]
 pub enum Instr {
     unreachable,
     nop,
@@ -146,9 +214,9 @@ pub enum Instr {
     else_end,
     end,
     Return,
-    Block(u8, MutableValue<Vec<Value<Instr>>>),
-    Loop(u8, MutableValue<Vec<Value<Instr>>>),
-    If(u8, MutableValue<Vec<Value<Instr>>>),
+    Block(BlockType, MutableValue<Vec<Value<Instr>>>),
+    Loop(BlockType, MutableValue<Vec<Value<Instr>>>),
+    If(BlockType, MutableValue<Vec<Value<Instr>>>),
 
     i32_const(i64),
     i64_const(i64),
@@ -294,23 +362,35 @@ pub enum Instr {
     i64_extend32_s,
 }
 
+pub type Expr = Value<Vec<Value<Instr>>>;
+
 #[derive(Debug)]
 pub enum Section {
     /// (Size, Section)
     Memory((Value<u32>, Vec<Memory>)),
-    Data((Value<u32>, Rc<RefCell<Vec<DataSegment>>>)),
+    Data((Value<u32>, Arc<Mutex<Vec<DataSegment>>>)),
     Code((Value<u32>, MutableValue<Vec<Code>>)),
-    Type((Value<u32>, Rc<RefCell<Vec<Type>>>)),
-    Func((Value<u32>, Rc<RefCell<Vec<u32>>>)),
-    Import((Value<u32>, Rc<RefCell<Vec<Import>>>)),
-    Table((Value<u32>, Rc<RefCell<Vec<Table>>>)),
+    Type((Value<u32>, Arc<Mutex<Vec<Type>>>)),
+    Func((Value<u32>, Arc<Mutex<Vec<u32>>>)),
+    Import((Value<u32>, Arc<Mutex<Vec<Import>>>)),
+    Table((Value<u32>, Arc<Mutex<Vec<Table>>>)),
+    Export((Value<u32>, Arc<Mutex<Vec<Export>>>)),
+    Element((Value<u32>, Arc<Mutex<Vec<Element>>>)),
+    Custom((Value<u32>, Arc<Mutex<CustomSection>>)),
+    Global((Value<u32>, Arc<Mutex<Vec<Global>>>)),
     /// (Id, Size, Section)
     Unknown((u8, u32, Vec<u8>)),
 }
 
 #[derive(Debug)]
+pub enum CustomSection {
+    Unknown(String, Vec<u8>),
+    Name(DebugNames),
+}
+
+#[derive(Debug)]
 pub struct Module {
-    pub sections: Rc<RefCell<Vec<Section>>>,
+    pub sections: Arc<Mutex<Vec<Value<Section>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -324,4 +404,42 @@ pub struct Import {
     pub module: String,
     pub name: String,
     pub typeidx: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct Export {
+    pub name: String,
+    pub descr: ExportDescr,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExportDescr {
+    Func(Arc<Mutex<u32>>),
+    Table(Arc<Mutex<u32>>),
+    Mem(Arc<Mutex<u32>>),
+    Global(Arc<Mutex<u32>>),
+}
+
+#[derive(Debug, Clone)]
+pub enum Element {
+    FuncActive(Expr, Arc<Mutex<Vec<u32>>>),
+}
+
+#[derive(Debug, Clone)]
+pub struct Global {
+    pub global_type: GlobalType,
+    pub expr: Expr,
+}
+
+#[derive(Debug, Clone)]
+pub struct GlobalType {
+    pub valtype: ValueType,
+    pub mutable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DebugNames {
+    pub module: String,
+    pub func_names: HashMap<u32, String>,
+    pub func_local_names: HashMap<u32, HashMap<u32, String>>,
 }

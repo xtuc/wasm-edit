@@ -1,11 +1,14 @@
-use std::cell::RefCell;
+use log::info;
 use std::io::stdin;
 use std::io::stdout;
 use std::io::Read;
 use std::io::Write;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Instant;
 
+mod coredump;
 mod instrument;
+mod wasi;
 use wasm_edit::{ast, parser, printer, traverse, update_value};
 
 type BoxError = Box<dyn std::error::Error>;
@@ -23,6 +26,12 @@ enum Commands {
 
     /// Instrument memory operations (WIP)
     InstrumentMemory {},
+
+    /// Add coredump and stack unwinding (WIP)
+    ///
+    /// After the program entered a trap, the global `unwind` is set to true
+    /// and we start unwinding the stack and collecting debugging informations.
+    Coredump {},
 }
 
 #[derive(Parser)]
@@ -41,8 +50,12 @@ fn main() -> Result<(), BoxError> {
     let mut input = Vec::new();
     stdin().read_to_end(&mut input)?;
 
-    let module =
-        parser::decode(&input).map_err(|err| format!("failed to parse Wasm module: {}", err))?;
+    let now = Instant::now();
+    let module = Arc::new(
+        parser::decode(&input).map_err(|err| format!("failed to parse Wasm module: {}", err))?,
+    );
+    let elapsed = now.elapsed();
+    info!("decode: {:.2?}", elapsed);
 
     match args.cmd {
         Commands::EditMemory { initial_memory } => {
@@ -59,33 +72,20 @@ fn main() -> Result<(), BoxError> {
         }
 
         Commands::InstrumentMemory { .. } => {
-            let text_offset = {
-                let visitor = Rc::new(instrument::MemoryInstrumentAddData {
-                    text_offset: RefCell::new(0),
-                    text: "called memory.grow\n",
-                });
-                traverse::traverse(&module, Rc::clone(&visitor) as Rc<dyn traverse::Visitor>);
-
-                let v = visitor.text_offset.borrow();
-                *v
-            };
-
-            let funcidx = {
-                let visitor = Rc::new(instrument::MemoryInstrumentAddRuntime {
-                    text_offset,
-                    fd_write: RefCell::new(0),
-                    typeidx: RefCell::new(0),
-                    funcidx: RefCell::new(0),
-                });
-                traverse::traverse(&module, Rc::clone(&visitor) as Rc<dyn traverse::Visitor>);
-
-                let v = visitor.funcidx.borrow();
-                *v
-            };
-
-            let visitor = instrument::MemoryInstrument { funcidx };
-            traverse::traverse(&module, Rc::new(visitor));
+            instrument::transform(Arc::clone(&module));
             input = printer::print(&module)?;
+        }
+
+        Commands::Coredump { .. } => {
+            let now = Instant::now();
+            coredump::transform(Arc::clone(&module));
+            let elapsed = now.elapsed();
+            info!("transform: {:.2?}", elapsed);
+
+            let now = Instant::now();
+            input = printer::print(&module)?;
+            let elapsed = now.elapsed();
+            info!("print: {:.2?}", elapsed);
         }
     };
 
@@ -94,8 +94,8 @@ fn main() -> Result<(), BoxError> {
 }
 
 fn get_main_memory<'a>(module: &'a ast::Module) -> Option<(ast::Memory, ast::Value<u32>)> {
-    for section in module.sections.borrow().iter() {
-        match section {
+    for section in module.sections.lock().unwrap().iter() {
+        match &section.value {
             ast::Section::Memory((size, memories)) => {
                 return Some((memories.first().unwrap().to_owned(), size.to_owned()));
             }
