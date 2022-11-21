@@ -7,19 +7,31 @@
 //!
 //! Where a `frame` is:
 //!
-//! | code offset (u32) | count local (u32) | local* (u32) |
+//! | funcidx (u32) | code offset (u32) | vec(local) |
+//!
+//! `vec`:
+//! | count (u32) | element* (u32) |
 
 use crate::ast;
 use crate::traverse::{locals_flatten, traverse, Visitor, VisitorContext, WasmModule};
+use crate::wasi;
+use crate::BoxError;
 use log::debug;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+// Debugging texts are placed at offset unlikely to be overridden by the
+// coredump
+const UNREACHABLE_SHIM_TEXT: u32 = 952;
+const UNWIND_TEXT: u32 = 976;
+const EDGE_TEXT: u32 = 1000;
+
 fn create_set_frame(module: &WasmModule, local_count: usize) -> u32 {
     let mut t = ast::Type {
         params: vec![
-            ast::ValueType::NumType(ast::NumType::I32), // code offset,
+            ast::ValueType::NumType(ast::NumType::I32), // funcidx
+            ast::ValueType::NumType(ast::NumType::I32), // code offset
         ],
         results: vec![],
     };
@@ -38,8 +50,9 @@ fn create_set_frame(module: &WasmModule, local_count: usize) -> u32 {
         set_locals.push(ast::Value::new(ast::Instr::local_get((i + 1) as u32)));
         set_locals.push(ast::Value::new(ast::Instr::i32_store(
             ast::make_value!(0),
-            8 + (i * 4) as u32,
+            (4 * 3) + (i * 4) as u32,
         )));
+        // Locals start after funcidx (u32), codeoffset (u32) and the vec(local) count (u32).
     }
 
     // The first frame base addr is after number of frame and next frame itself.
@@ -60,16 +73,21 @@ fn create_set_frame(module: &WasmModule, local_count: usize) -> u32 {
                 Arc::new(Mutex::new(initial_base_addr))
             )),
         ],
-        // Create frame struct
         [
-            // set code offset param
+            // set funcidx
             ast::Value::new(ast::Instr::local_get(base_addr)),
             ast::Value::new(ast::Instr::local_get(0)),
             ast::Value::new(ast::Instr::i32_store(zero.clone(), 0)),
+            // set code offset param
+            ast::Value::new(ast::Instr::local_get(base_addr)),
+            ast::Value::new(ast::Instr::local_get(0)),
+            ast::Value::new(ast::Instr::i32_store(zero.clone(), 4)),
+        ],
+        [
             // set count local
             ast::Value::new(ast::Instr::local_get(base_addr)),
             ast::Value::new(ast::Instr::i32_const(local_count as i64)),
-            ast::Value::new(ast::Instr::i32_store(ast::make_value!(0), 4)),
+            ast::Value::new(ast::Instr::i32_store(ast::make_value!(0), 2 * 4)),
         ],
         set_locals,
         // Update frame counter
@@ -84,7 +102,9 @@ fn create_set_frame(module: &WasmModule, local_count: usize) -> u32 {
         // Update next frame addr
         [
             ast::Value::new(ast::Instr::i32_const(4)),
-            ast::Value::new(ast::Instr::i32_const(8 + (local_count * 4) as i64)),
+            ast::Value::new(ast::Instr::i32_const((4 * 3) + (local_count * 4) as i64)),
+            // frame struct is: funcidx (u32) + codeoffset (u32) + the vec(local) count (u32) +
+            // local count * 4 (u32).
             ast::Value::new(ast::Instr::local_get(base_addr)),
             ast::Value::new(ast::Instr::i32_add),
             ast::Value::new(ast::Instr::i32_store(zero, 0)),
@@ -105,6 +125,7 @@ fn create_set_frame(module: &WasmModule, local_count: usize) -> u32 {
 }
 
 struct CoredumpTransform {
+    verbose: bool,
     is_unwinding: u32,
     unreachable_shim: u32,
     /// Mapping between target func local count and set_frame function
@@ -182,15 +203,21 @@ impl Visitor for CoredumpTransform {
 
                 // call set_frame
                 {
-                    // In Wasm DWARF the offset is relative to the start of the
-                    // code section.
-                    // https://yurydelendik.github.io/webassembly-dwarf/#pc
-                    // let code_offset = ctx.node.start_offset as i64
-                    //     - ctx.module.get_code_section_start_offset().unwrap() as i64;
-                    // body.push(ast::Value::new(ast::Instr::i32_const(code_offset as i64)));
+                    if self.verbose {
+                        let fd_write = ctx.module.find_import("fd_write");
+                        body.extend(wasi::print(fd_write, UNWIND_TEXT));
+                    }
+
                     // FIXME: we use the funcidx because the code offset isn't accurate
                     // or buggy.
                     body.push(ast::Value::new(ast::Instr::i32_const(curr_funcidx as i64)));
+
+                    // In Wasm DWARF the offset is relative to the start of the
+                    // code section.
+                    // https://yurydelendik.github.io/webassembly-dwarf/#pc
+                    let code_offset = ctx.node.start_offset as i64
+                        - ctx.module.get_code_section_start_offset().unwrap() as i64;
+                    body.push(ast::Value::new(ast::Instr::i32_const(code_offset as i64)));
 
                     let func_locals = ctx.module.func_locals(curr_funcidx);
 
@@ -238,8 +265,10 @@ impl Visitor for CoredumpTransform {
                 if ctx.module.is_func_exported(curr_funcidx) {
                     // We are at the edge of the module, stop unwinding the
                     // stack and trap.
-                    // let fd_write = ctx.module.find_import("fd_write");
-                    // body.extend_from_slice(&wasi::print(fd_write, 64));
+                    if self.verbose {
+                        let fd_write = ctx.module.find_import("fd_write");
+                        body.extend_from_slice(&wasi::print(fd_write, EDGE_TEXT));
+                    }
                     body.push(ast::Value::new(ast::Instr::unreachable));
                 } else {
                     // Add values on the stack to satisfy the current function result
@@ -276,8 +305,9 @@ impl Visitor for CoredumpTransform {
     }
 }
 
-pub fn transform(module_ast: Arc<ast::Module>) {
+pub fn transform(module_ast: Arc<ast::Module>, verbose: bool) -> Result<(), BoxError> {
     let module = WasmModule::new(Arc::clone(&module_ast));
+    let fd_write = module.find_import("fd_write");
 
     debug!(
         "code section starts at {}",
@@ -302,17 +332,26 @@ pub fn transform(module_ast: Arc<ast::Module>) {
     debug!("is_unwinding global at {}", is_unwinding);
 
     // Add debugging text
-    // let (text1, _text1_end) = module.add_data(36, &wasi::str(36, "unreachable_shim\n"));
-    // let (text2, _text2_end) = module.add_data(64, &wasi::str(64, "edge\n"));
+    if verbose {
+        let _ = module.add_data(
+            UNREACHABLE_SHIM_TEXT,
+            &wasi::str(UNREACHABLE_SHIM_TEXT, "unreachable_shim\n"),
+        );
+        let _ = module.add_data(UNWIND_TEXT, &wasi::str(UNWIND_TEXT, "unwind\n"));
+        let _ = module.add_data(EDGE_TEXT, &wasi::str(EDGE_TEXT, "edge\n"));
+    }
 
     // Add `unreachable_shim`
     let unreachable_shim = {
         let t = ast::make_type! {};
         let typeidx = module.add_type(&t);
 
-        // let fd_write = module.find_import("fd_write");
         let body = ast::body![
-            // wasi::print(fd_write, text1),
+            if verbose {
+                wasi::print(fd_write, UNREACHABLE_SHIM_TEXT)
+            } else {
+                vec![]
+            },
             [
                 ast::Value::new(ast::Instr::i32_const(1)),
                 ast::Value::new(ast::Instr::global_set(is_unwinding))
@@ -336,9 +375,12 @@ pub fn transform(module_ast: Arc<ast::Module>) {
     }
 
     let visitor = CoredumpTransform {
+        verbose,
         is_unwinding,
         unreachable_shim,
         set_frame_funcs,
     };
     traverse(Arc::clone(&module_ast), Arc::new(visitor));
+
+    Ok(())
 }

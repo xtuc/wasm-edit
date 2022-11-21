@@ -211,6 +211,7 @@ fn decode_section_custom<'a>(
     })
 }
 
+// https://github.com/WebAssembly/extended-name-section/blob/main/proposals/extended-name-section/Overview.md
 fn decode_section_custom_name<'a>(
     ctx: InputContext<'a>,
 ) -> IResult<InputContext<'a>, ast::DebugNames> {

@@ -11,7 +11,7 @@ mod instrument;
 mod wasi;
 use wasm_edit::{ast, parser, printer, traverse, update_value};
 
-type BoxError = Box<dyn std::error::Error>;
+pub(crate) type BoxError = Box<dyn std::error::Error>;
 
 use clap::{Parser, Subcommand};
 
@@ -24,14 +24,18 @@ enum Commands {
         initial_memory: Option<u32>,
     },
 
-    /// Instrument memory operations (WIP)
+    /// Instrument memory operations
     InstrumentMemory {},
 
-    /// Add coredump and stack unwinding (WIP)
+    /// Add coredump and stack unwinding
     ///
     /// After the program entered a trap, the global `unwind` is set to true
     /// and we start unwinding the stack and collecting debugging informations.
-    Coredump {},
+    Coredump {
+        /// Enable verbose mode
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 #[derive(Parser)]
@@ -76,9 +80,9 @@ fn main() -> Result<(), BoxError> {
             input = printer::print(&module)?;
         }
 
-        Commands::Coredump { .. } => {
+        Commands::Coredump { verbose } => {
             let now = Instant::now();
-            coredump::transform(Arc::clone(&module));
+            coredump::transform(Arc::clone(&module), verbose)?;
             let elapsed = now.elapsed();
             info!("transform: {:.2?}", elapsed);
 
