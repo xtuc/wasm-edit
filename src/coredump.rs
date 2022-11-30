@@ -137,7 +137,60 @@ impl Visitor for CoredumpTransform {
                 ctx.insert_node_before(ast::Instr::call(unreachable_shim));
             }
 
-            // TODO: call set_frame
+            // call set_frame
+            {
+                // In Wasm DWARF the offset is relative to the start of the
+                // code section.
+                // https://yurydelendik.github.io/webassembly-dwarf/#pc
+                // let code_offset = ctx.node.start_offset as i64
+                //     - ctx.module.get_code_section_start_offset().unwrap() as i64;
+                // body.push(ast::Value::new(ast::Instr::i32_const(code_offset as i64)));
+                // FIXME: we use the funcidx because the code offset isn't accurate
+                // or buggy.
+                ctx.insert_node_before(ast::Instr::i32_const(curr_funcidx as i64));
+
+                let func_locals = ctx.module.func_locals(curr_funcidx);
+
+                // TODO: for now we don't care about function arguments
+                // because seems that Rust doesn't really use them anyway.
+                for i in 0..curr_func_type.params.len() {
+                    ctx.insert_node_before(ast::Instr::i32_const(669 + i as i64));
+                }
+
+                let locals = locals_flatten(func_locals);
+
+                // Collect the base/stack pointer, usually Rust stores it in
+                // the first few locals (so after the function params).
+                let mut local_count = curr_func_type.params.len() as u32;
+
+                for local in locals {
+                    ctx.insert_node_before(ast::Instr::local_get(local_count));
+                    if local.value_type == ast::ValueType::NumType(ast::NumType::I64) {
+                        ctx.insert_node_before(ast::Instr::i32_wrap_i64);
+                    }
+                    if local.value_type == ast::ValueType::NumType(ast::NumType::F64) {
+                        ctx.insert_node_before(ast::Instr::i32_trunc_f64_u);
+                    }
+                    if local.value_type == ast::ValueType::NumType(ast::NumType::F32) {
+                        ctx.insert_node_before(ast::Instr::i32_trunc_f32_u);
+                    }
+                    local_count += 1;
+
+                    // Only collect up to 10 locals after the function args
+                    // because Rust usually stores the base addr there.
+                    if local_count >= curr_func_type.params.len() as u32 + 15 {
+                        break;
+                    }
+                }
+
+                let set_frame = *self
+                    .set_frame_funcs
+                    .get(&local_count)
+                    .expect(&format!("no set_frame for local count: {}", local_count));
+
+                let set_frame = Arc::new(Mutex::new(ast::Value::new(set_frame)));
+                ctx.insert_node_before(ast::Instr::call(set_frame));
+            }
 
             // Return from the current function
             // Add values on the stack to satisfy the current function result
