@@ -1,6 +1,6 @@
 [package]
 name = "wasm-edit"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Edit and instrument already compiled Wasm binaries"
 authors = ["Sven Sauleau <sven@cloudflare.com>"]
