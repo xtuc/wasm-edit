@@ -109,8 +109,8 @@ impl WasmModule {
         (funcidx as usize) < self.imports.len()
     }
 
-    pub fn imports(&self) -> Vec<ast::Import> {
-        self.imports
+    pub fn imports(&self) -> &Vec<ast::Import> {
+        &self.imports
     }
 
     pub fn func_locals_count(&self, funcidx: u32) -> u32 {
