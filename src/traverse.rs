@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use threadpool::ThreadPool;
 
+type BoxError = Box<dyn std::error::Error>;
+
 pub fn locals_flatten(locals: Vec<ast::CodeLocal>) -> Vec<ast::CodeLocal> {
     let mut out = Vec::new();
 
@@ -27,6 +29,7 @@ pub struct WasmModule {
     func_locals: HashMap<u32, Vec<ast::CodeLocal>>,
     func_to_typeidx: Mutex<Vec<u32>>,
     func_starts: HashMap<u32, usize>,
+    func_code: HashMap<u32, ast::Code>,
     imports: Vec<ast::Import>,
     exports: Vec<ast::Export>,
 }
@@ -38,6 +41,7 @@ impl WasmModule {
         let mut imports = Vec::new();
         let mut exports = Vec::new();
         let mut func_starts = HashMap::new();
+        let mut func_code = HashMap::new();
 
         for section in inner.sections.lock().unwrap().iter() {
             match &section.value {
@@ -65,6 +69,8 @@ impl WasmModule {
                     let mut funcidx = imports.len() as u32;
 
                     for c in &content.lock().unwrap().value {
+                        func_code.insert(funcidx, c.clone());
+
                         func_starts.insert(funcidx as u32, c.body.lock().unwrap().start_offset);
                         func_locals.insert(funcidx, c.locals.clone());
                         funcidx += 1;
@@ -80,6 +86,7 @@ impl WasmModule {
             exports,
             func_locals,
             func_starts,
+            func_code,
             types: Mutex::new(types),
             func_to_typeidx: Mutex::new(func_to_typeidx),
         }
@@ -90,11 +97,12 @@ impl WasmModule {
             match &section.value {
                 ast::Section::Data((_section_size, content)) => {
                     let segment = ast::DataSegment {
-                        offset: ast::Value::new(vec![
+                        offset: Some(ast::Value::new(vec![
                             ast::Value::new(ast::Instr::i32_const(offset as i64)),
                             ast::Value::new(ast::Instr::end),
-                        ]),
+                        ])),
                         bytes: bytes.to_vec(),
+                        mode: ast::DataSegmentMode::Active,
                     };
                     content.lock().unwrap().push(segment);
                 }
@@ -144,6 +152,25 @@ impl WasmModule {
         }
 
         false
+    }
+
+    pub fn get_export_func(&self, name: &str) -> Result<&ast::Code, BoxError> {
+        for export in &self.exports {
+            if export.name == name {
+                match &export.descr {
+                    ast::ExportDescr::Func(f) => {
+                        let funcidx = &*f.lock().unwrap();
+                        return self
+                            .func_code
+                            .get(funcidx)
+                            .ok_or("exported function not found".into());
+                    }
+                    _ => return Err("export is not a function".into()),
+                }
+            }
+        }
+
+        Err("export not found".into())
     }
 
     /// Retrieve the type of a function,
@@ -261,7 +288,14 @@ impl WasmModule {
             }
         }
 
-        None
+        let globals = vec![global.to_owned()];
+        let global_section = ast::Section::Global((
+            ast::Value::new(0), // section size will be set during encoding
+            Arc::new(Mutex::new(globals)),
+        ));
+
+        self.add_section(global_section);
+        return Some(0);
     }
 
     pub fn add_function(&self, func: &ast::Code, typeidx: u32) -> u32 {
@@ -304,6 +338,12 @@ impl WasmModule {
         }
 
         typeidx
+    }
+
+    pub fn add_section(&self, s: ast::Section) {
+        let mut sections = self.inner.sections.lock().unwrap();
+        sections.push(ast::Value::new(s));
+        sections.sort_by(|a, b| a.pos().cmp(&b.pos()));
     }
 }
 

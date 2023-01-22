@@ -9,104 +9,19 @@
 //!
 //! | code offset (u32) | count local (u32) | local* (u32) |
 
-use crate::ast;
 use crate::traverse::{locals_flatten, traverse, Visitor, VisitorContext, WasmModule};
+use crate::{ast, BoxError};
 use log::debug;
 use std::collections::HashMap;
+use std::fs;
 use std::sync::Arc;
 use std::sync::Mutex;
-
-fn create_set_frame(module: &WasmModule, local_count: usize) -> u32 {
-    let mut t = ast::Type {
-        params: vec![
-            ast::ValueType::NumType(ast::NumType::I32), // code offset,
-        ],
-        results: vec![],
-    };
-    for _ in 0..local_count {
-        t.params.push(ast::ValueType::NumType(ast::NumType::I32));
-    }
-    let typeidx = module.add_type(&t);
-
-    let zero = Arc::new(Mutex::new(ast::Value::new(0)));
-    let base_addr = t.params.len() as u32;
-
-    let mut set_locals = vec![];
-    for i in 0..local_count {
-        set_locals.push(ast::Value::new(ast::Instr::local_get(base_addr)));
-        // Skip the first local as it's the code offset argument
-        set_locals.push(ast::Value::new(ast::Instr::local_get((i + 1) as u32)));
-        set_locals.push(ast::Value::new(ast::Instr::i32_store(
-            ast::make_value!(0),
-            8 + (i * 4) as u32,
-        )));
-    }
-
-    // The first frame base addr is after number of frame and next frame itself.
-    let initial_base_addr = ast::body![[
-        ast::Value::new(ast::Instr::i32_const(4 * 2)),
-        ast::Value::new(ast::Instr::local_set(base_addr)),
-    ]];
-
-    let body = ast::body![
-        // Load next frame base addr
-        [
-            ast::Value::new(ast::Instr::i32_const(4)),
-            ast::Value::new(ast::Instr::i32_load(zero.clone(), 0)),
-            ast::Value::new(ast::Instr::local_tee(base_addr)),
-            ast::Value::new(ast::Instr::i32_eqz),
-            ast::Value::new(ast::Instr::If(
-                ast::BlockType::Empty,
-                Arc::new(Mutex::new(initial_base_addr))
-            )),
-        ],
-        // Create frame struct
-        [
-            // set code offset param
-            ast::Value::new(ast::Instr::local_get(base_addr)),
-            ast::Value::new(ast::Instr::local_get(0)),
-            ast::Value::new(ast::Instr::i32_store(zero.clone(), 0)),
-            // set count local
-            ast::Value::new(ast::Instr::local_get(base_addr)),
-            ast::Value::new(ast::Instr::i32_const(local_count as i64)),
-            ast::Value::new(ast::Instr::i32_store(ast::make_value!(0), 4)),
-        ],
-        set_locals,
-        // Update frame counter
-        [
-            ast::Value::new(ast::Instr::i32_const(0)),
-            ast::Value::new(ast::Instr::i32_const(0)),
-            ast::Value::new(ast::Instr::i32_load(zero.clone(), 0)), // load number of frames
-            ast::Value::new(ast::Instr::i32_const(1)),
-            ast::Value::new(ast::Instr::i32_add),
-            ast::Value::new(ast::Instr::i32_store(zero.clone(), 0)), // update number of frames
-        ],
-        // Update next frame addr
-        [
-            ast::Value::new(ast::Instr::i32_const(4)),
-            ast::Value::new(ast::Instr::i32_const(8 + (local_count * 4) as i64)),
-            ast::Value::new(ast::Instr::local_get(base_addr)),
-            ast::Value::new(ast::Instr::i32_add),
-            ast::Value::new(ast::Instr::i32_store(zero, 0)),
-        ]
-    ];
-    let func = ast::Code {
-        locals: vec![
-            // Holds the base addr for the frame struct
-            ast::CodeLocal {
-                count: 1,
-                value_type: ast::ValueType::NumType(ast::NumType::I32),
-            },
-        ],
-        size: ast::Value::new(0), // printer calculates based on the body
-        body: Arc::new(Mutex::new(body)),
-    };
-    module.add_function(&func, typeidx)
-}
+use wasm_edit::{parser, printer, traverse, update_value};
 
 struct CoredumpTransform {
     is_unwinding: u32,
     unreachable_shim: u32,
+    write_coredump: u32,
     /// Mapping between target func local count and set_frame function
     set_frame_funcs: HashMap<u32, u32>,
 }
@@ -218,6 +133,7 @@ impl Visitor for CoredumpTransform {
 
             // We don't need to continue in the func, it's unreachable.
             ctx.stop_traversal();
+            return;
         }
 
         // After each call, check if we are unwinding the stack and need to continue
@@ -291,8 +207,8 @@ impl Visitor for CoredumpTransform {
                 if ctx.module.is_func_exported(curr_funcidx) {
                     // We are at the edge of the module, stop unwinding the
                     // stack and trap.
-                    // let fd_write = ctx.module.find_import("fd_write");
-                    // body.extend_from_slice(&wasi::print(fd_write, 64));
+                    let write_coredump = Arc::new(Mutex::new(ast::Value::new(self.write_coredump)));
+                    body.push(ast::Value::new(ast::Instr::call(write_coredump)));
                     body.push(ast::Value::new(ast::Instr::unreachable));
                 } else {
                     // Add values on the stack to satisfy the current function result
@@ -325,12 +241,23 @@ impl Visitor for CoredumpTransform {
                 let if_node = ast::Instr::If(ast::BlockType::Empty, Arc::new(Mutex::new(body)));
                 ctx.insert_node_after(if_node);
             }
+            return;
         }
     }
 }
 
-pub fn transform(module_ast: Arc<ast::Module>) {
+fn get_runtime() -> Result<WasmModule, BoxError> {
+    let contents = include_bytes!("../runtime/build/runtime.wasm");
+    let module_ast = parser::decode(contents)
+        .map_err(|err| format!("failed to parse runtime Wasm module: {}", err))?;
+    let module = WasmModule::new(Arc::new(module_ast));
+
+    return Ok(module);
+}
+
+pub fn transform(module_ast: Arc<ast::Module>) -> Result<(), BoxError> {
     let module = WasmModule::new(Arc::clone(&module_ast));
+    let runtime = get_runtime()?;
 
     debug!(
         "code section starts at {}",
@@ -354,23 +281,15 @@ pub fn transform(module_ast: Arc<ast::Module>) {
     };
     debug!("is_unwinding global at {}", is_unwinding);
 
-    // Add debugging text
-    // let (text1, _text1_end) = module.add_data(36, &wasi::str(36, "unreachable_shim\n"));
-    // let (text2, _text2_end) = module.add_data(64, &wasi::str(64, "edge\n"));
-
     // Add `unreachable_shim`
     let unreachable_shim = {
         let t = ast::make_type! {};
         let typeidx = module.add_type(&t);
 
-        // let fd_write = module.find_import("fd_write");
-        let body = ast::body![
-            // wasi::print(fd_write, text1),
-            [
-                ast::Value::new(ast::Instr::i32_const(1)),
-                ast::Value::new(ast::Instr::global_set(is_unwinding))
-            ]
-        ];
+        let body = ast::body![[
+            ast::Value::new(ast::Instr::i32_const(1)),
+            ast::Value::new(ast::Instr::global_set(is_unwinding))
+        ]];
         let func = ast::Code {
             locals: vec![],
             size: ast::Value::new(0), // printer calculates based on the body
@@ -383,15 +302,45 @@ pub fn transform(module_ast: Arc<ast::Module>) {
     // Add `set_frame{}` functions
     let mut set_frame_funcs = HashMap::new();
     for i in 0..30 {
-        let funcidx = create_set_frame(&module, i);
+        let func = runtime
+            .get_export_func(&format!("set_frame{}", i))
+            .expect("failed to get set_frame1");
+
+        // add type
+        let typeidx = {
+            let mut t = ast::Type {
+                params: vec![
+                    ast::ValueType::NumType(ast::NumType::I32), // code offset,
+                ],
+                results: vec![],
+            };
+            for _ in 0..i {
+                t.params.push(ast::ValueType::NumType(ast::NumType::I32));
+            }
+            module.add_type(&t)
+        };
+
+        let funcidx = module.add_function(&func, typeidx);
         debug!("set_frame{} func at {}", i, funcidx);
         set_frame_funcs.insert(i as u32, funcidx);
     }
+
+    let write_coredump = {
+        let typeidx = module.add_type(&ast::make_type!());
+        let func = runtime
+            .get_export_func("write_coredump")
+            .expect("failed to get write_coredump");
+        module.add_function(&func, typeidx)
+    };
+    debug!("write_coredump func at {}", write_coredump);
 
     let visitor = CoredumpTransform {
         is_unwinding,
         unreachable_shim,
         set_frame_funcs,
+        write_coredump,
     };
     traverse(Arc::clone(&module_ast), Arc::new(visitor));
+
+    Ok(())
 }

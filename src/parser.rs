@@ -815,6 +815,36 @@ fn decode_instr<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Val
     decode_instr!(0xc3, i64_extend16_s);
     decode_instr!(0xc4, i64_extend32_s);
 
+    if id == 0xfc {
+        let (ctx, b) = ctx.read_u8()?;
+        let end_offset = ctx.offset;
+
+        match b {
+            10 => {
+                let (ctx, imm0) = ctx.read_u8()?;
+                let (ctx, imm1) = ctx.read_u8()?;
+                let value = ast::Value {
+                    start_offset,
+                    value: ast::Instr::memory_copy(imm0, imm1),
+                    end_offset,
+                };
+                return Ok((ctx, value));
+            }
+            11 => {
+                let (ctx, imm0) = ctx.read_u8()?;
+                let value = ast::Value {
+                    start_offset,
+                    value: ast::Instr::memory_fill(imm0),
+                    end_offset,
+                };
+                return Ok((ctx, value));
+            }
+            b => {
+                unimplemented!("unknown 0xfc operation {}", b)
+            }
+        }
+    }
+
     unimplemented!("unknown instruction: {:#x}", id);
 }
 
@@ -885,7 +915,17 @@ fn decode_data<'a>(ctx: InputContext<'a>) -> IResult<InputContext<'a>, ast::Data
             let (ctx, expr) = decode_expr(ctx, ast::Instr::end)?;
             let (ctx, bytes) = decode_vec(ctx, |ctx| ctx.read_u8())?;
             let data_segment = ast::DataSegment {
-                offset: expr,
+                mode: ast::DataSegmentMode::Active,
+                offset: Some(expr),
+                bytes,
+            };
+            Ok((ctx, data_segment))
+        }
+        1 => {
+            let (ctx, bytes) = decode_vec(ctx, |ctx| ctx.read_u8())?;
+            let data_segment = ast::DataSegment {
+                mode: ast::DataSegmentMode::Passive,
+                offset: None,
                 bytes,
             };
             Ok((ctx, data_segment))

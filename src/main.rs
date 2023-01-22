@@ -11,7 +11,7 @@ mod instrument;
 mod wasi;
 use wasm_edit::{ast, parser, printer, traverse, update_value};
 
-type BoxError = Box<dyn std::error::Error>;
+pub(crate) type BoxError = Box<dyn std::error::Error>;
 
 use clap::{Parser, Subcommand};
 
@@ -78,7 +78,7 @@ fn main() -> Result<(), BoxError> {
 
         Commands::Coredump { .. } => {
             let now = Instant::now();
-            coredump::transform(Arc::clone(&module));
+            coredump::transform(Arc::clone(&module))?;
             let elapsed = now.elapsed();
             info!("transform: {:.2?}", elapsed);
 

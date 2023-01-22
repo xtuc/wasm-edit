@@ -214,8 +214,14 @@ fn write_section_data(
     write_vec_len(buffer, &content); // vec length
 
     for data_segment in content {
-        write_unsigned_leb128(buffer, 0);
-        write_code_expr(buffer, &data_segment.offset.value);
+        if data_segment.mode == ast::DataSegmentMode::Active {
+            write_unsigned_leb128(buffer, 0);
+            if let Some(offset) = &data_segment.offset {
+                write_code_expr(buffer, &offset.value);
+            }
+        } else {
+            write_unsigned_leb128(buffer, 1);
+        }
 
         write_vec_len(buffer, &data_segment.bytes); // vec length
         buffer.write(&data_segment.bytes)?;
@@ -647,6 +653,20 @@ fn write_code_expr(buffer: &mut Vec<u8>, expr: &Vec<ast::Value<ast::Instr>>) {
         write_instr!(0xc2, i64_extend8_s);
         write_instr!(0xc3, i64_extend16_s);
         write_instr!(0xc4, i64_extend32_s);
+
+        if let ast::Instr::memory_copy(imm0, imm1) = id {
+            buffer.push(0xfc);
+            buffer.push(10);
+            buffer.push(imm0);
+            buffer.push(imm1);
+            continue;
+        }
+        if let ast::Instr::memory_fill(imm0) = id {
+            buffer.push(0xfc);
+            buffer.push(11);
+            buffer.push(imm0);
+            continue;
+        }
 
         unimplemented!("unknown instruction: {:#?}", id);
     }

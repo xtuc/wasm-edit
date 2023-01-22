@@ -137,13 +137,20 @@ pub struct Table {
 
 #[derive(Debug, Clone)]
 pub struct DataSegment {
-    pub offset: Value<Vec<Value<Instr>>>,
+    pub offset: Option<Value<Vec<Value<Instr>>>>,
     pub bytes: Vec<u8>,
+    pub mode: DataSegmentMode,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DataSegmentMode {
+    Passive,
+    Active,
 }
 
 impl DataSegment {
     pub fn compute_offset(&self) -> i64 {
-        let expr = &self.offset.value;
+        let expr = &self.offset.as_ref().unwrap().value;
         for instr in expr {
             if let Instr::i32_const(v) = instr.value {
                 return v;
@@ -207,6 +214,8 @@ pub enum Instr {
 
     memory_size(u8),
     memory_grow(u8),
+    memory_copy(u8, u8),
+    memory_fill(u8),
 
     br(u32),
     br_if(u32),
@@ -380,6 +389,27 @@ pub enum Section {
     Global((Value<u32>, Arc<Mutex<Vec<Global>>>)),
     /// (Id, Size, Section)
     Unknown((u8, u32, Vec<u8>)),
+}
+
+impl Value<Section> {
+    pub fn pos(&self) -> usize {
+        use Section::*;
+
+        match self.value {
+            Type(_) => 1,
+            Import(_) => 2,
+            Func(_) => 3,
+            Table(_) => 4,
+            Memory(_) => 5,
+            Global(_) => 6,
+            Export(_) => 7,
+            // Start(_) => 8,
+            Element(_) => 9,
+            Code(_) => 10,
+            Data(_) => 11,
+            Custom(_) | Unknown(_) => 99,
+        }
+    }
 }
 
 #[derive(Debug)]
