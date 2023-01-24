@@ -7,6 +7,7 @@ authors = ["Sven Sauleau <sven@cloudflare.com>"]
 license = "MIT"
 keywords = ["wasm", "edit", "transform", "parser", "instrument"]
 repository = "https://github.com/xtuc/wasm-edit"
+include = ["runtime/build/runtime.wasm", "src/"]
 
 [dependencies]
 clap = { version = "4.0.17", features = ["derive"] }
