@@ -12,21 +12,60 @@
 use crate::traverse::{locals_flatten, traverse, Visitor, VisitorContext, WasmModule};
 use crate::{ast, BoxError};
 use log::debug;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 use std::sync::Mutex;
 use wasm_edit::{parser, printer, traverse, update_value};
 
+/// Mapping of set_frame* to func, lazyly added to the Wasm module if missing
+/// from the map.
+struct LazySetFrameMap {
+    module: WasmModule,
+    runtime: WasmModule,
+    /// Mapping between local count and corresponding set_frame function
+    map: HashMap<u32, u32>,
+}
+impl LazySetFrameMap {
+    fn get(&mut self, nargs: u32) -> u32 {
+        if let Some(funcidx) = self.map.get(&nargs) {
+            return *funcidx;
+        }
+
+        let func_name = format!("set_frame{}", nargs);
+        let func = self
+            .runtime
+            .get_export_func(&func_name)
+            .expect(&format!("failed to get {}", func_name));
+
+        let typeidx = {
+            let mut t = ast::Type {
+                params: vec![
+                    ast::ValueType::NumType(ast::NumType::I32), // code offset,
+                ],
+                results: vec![],
+            };
+            for _ in 0..nargs {
+                t.params.push(ast::ValueType::NumType(ast::NumType::I32));
+            }
+            self.module.add_type(&t)
+        };
+
+        let funcidx = self.module.add_function(&func, typeidx);
+        debug!("set_frame{} func at {}", nargs, funcidx);
+        self.map.insert(nargs, funcidx);
+
+        funcidx
+    }
+}
+
 struct CoredumpTransform {
     is_unwinding: u32,
     unreachable_shim: u32,
     write_coredump: u32,
-    /// Mapping between target func local count and set_frame function
-    set_frame_funcs: HashMap<u32, u32>,
+    set_frame_funcs: Arc<Mutex<LazySetFrameMap>>,
 }
-
-impl CoredumpTransform {}
 
 impl Visitor for CoredumpTransform {
     fn visit_instr<'a>(&self, ctx: &mut VisitorContext<'a, ast::Value<ast::Instr>>) {
@@ -34,11 +73,6 @@ impl Visitor for CoredumpTransform {
         let curr_func_type = ctx.module.get_func_type(curr_funcidx);
 
         // Don't transform our own runtime functions
-        for (_, funcidx) in &self.set_frame_funcs {
-            if curr_funcidx == *funcidx {
-                return;
-            }
-        }
         if curr_funcidx == self.unreachable_shim {
             return;
         }
@@ -98,11 +132,7 @@ impl Visitor for CoredumpTransform {
                     }
                 }
 
-                let set_frame = *self
-                    .set_frame_funcs
-                    .get(&local_count)
-                    .expect(&format!("no set_frame for local count: {}", local_count));
-
+                let set_frame = self.set_frame_funcs.lock().unwrap().get(local_count);
                 let set_frame = Arc::new(Mutex::new(ast::Value::new(set_frame)));
                 ctx.insert_node_before(ast::Instr::call(set_frame));
             }
@@ -195,11 +225,7 @@ impl Visitor for CoredumpTransform {
                         }
                     }
 
-                    let set_frame = *self
-                        .set_frame_funcs
-                        .get(&local_count)
-                        .expect(&format!("no set_frame for local count: {}", local_count));
-
+                    let set_frame = self.set_frame_funcs.lock().unwrap().get(local_count);
                     let set_frame = Arc::new(Mutex::new(ast::Value::new(set_frame)));
                     body.push(ast::Value::new(ast::Instr::call(set_frame)));
                 }
@@ -299,32 +325,6 @@ pub fn transform(module_ast: Arc<ast::Module>) -> Result<(), BoxError> {
     };
     debug!("unreachable_shim func at {}", unreachable_shim);
 
-    // Add `set_frame{}` functions
-    let mut set_frame_funcs = HashMap::new();
-    for i in 0..30 {
-        let func = runtime
-            .get_export_func(&format!("set_frame{}", i))
-            .expect("failed to get set_frame1");
-
-        // add type
-        let typeidx = {
-            let mut t = ast::Type {
-                params: vec![
-                    ast::ValueType::NumType(ast::NumType::I32), // code offset,
-                ],
-                results: vec![],
-            };
-            for _ in 0..i {
-                t.params.push(ast::ValueType::NumType(ast::NumType::I32));
-            }
-            module.add_type(&t)
-        };
-
-        let funcidx = module.add_function(&func, typeidx);
-        debug!("set_frame{} func at {}", i, funcidx);
-        set_frame_funcs.insert(i as u32, funcidx);
-    }
-
     let write_coredump = {
         let typeidx = module.add_type(&ast::make_type!());
         let func = runtime
@@ -334,11 +334,17 @@ pub fn transform(module_ast: Arc<ast::Module>) -> Result<(), BoxError> {
     };
     debug!("write_coredump func at {}", write_coredump);
 
+    let set_frame_funcs = LazySetFrameMap {
+        module,
+        runtime,
+        map: HashMap::new(),
+    };
+
     let visitor = CoredumpTransform {
         is_unwinding,
         unreachable_shim,
-        set_frame_funcs,
         write_coredump,
+        set_frame_funcs: Arc::new(Mutex::new(set_frame_funcs)),
     };
     traverse(Arc::clone(&module_ast), Arc::new(visitor));
 
