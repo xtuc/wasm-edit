@@ -2,6 +2,10 @@
 
 > Edit and instrument already compiled Wasm binaries
 
+## Coredump generation
+
+Moved to https://github.com/xtuc/wasm-coredump.
+
 ## Install
 
 ```
@@ -24,10 +28,6 @@ wasm-edit instrument-memory < input.wasm > output.wasm
 
 Requires Wasi, but doesn't require any change on the host.
 Tested with Rust and theoretically working with C/C++ (clang).
-
-## Coredump generation
-
-Moved to [https://github.com/xtuc/wasm-coredump].
 
 ## Running into stack overflow
 
