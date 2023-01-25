@@ -27,18 +27,7 @@ Tested with Rust and theoretically working with C/C++ (clang).
 
 ## Coredump generation
 
-Add the coredump generation:
-
-```
-wasm-edit coredump < input.wasm > output.wasm
-```
-
-When WebAssembly encounters a `unreachable` instruction it will unwind
-the stack, collect informations and generate a coredump.
-
-The coredump struct is stored at a fixed location, this might conflict with other transformations like asyncify.
-
-Collect the entire WebAssembly memory and use [wasmgdb] to analyze.
+Moved to [https://github.com/xtuc/wasm-coredump].
 
 ## Running into stack overflow
 
