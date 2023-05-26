@@ -6,7 +6,6 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
-mod coredump;
 mod instrument;
 mod wasi;
 use wasm_edit::{ast, parser, printer, traverse, update_value};
@@ -26,12 +25,6 @@ enum Commands {
 
     /// Instrument memory operations (WIP)
     InstrumentMemory {},
-
-    /// Add coredump and stack unwinding (WIP)
-    ///
-    /// After the program entered a trap, the global `unwind` is set to true
-    /// and we start unwinding the stack and collecting debugging informations.
-    Coredump {},
 }
 
 #[derive(Parser)]
@@ -74,18 +67,6 @@ fn main() -> Result<(), BoxError> {
         Commands::InstrumentMemory { .. } => {
             instrument::transform(Arc::clone(&module));
             input = printer::print(&module)?;
-        }
-
-        Commands::Coredump { .. } => {
-            let now = Instant::now();
-            coredump::transform(Arc::clone(&module))?;
-            let elapsed = now.elapsed();
-            info!("transform: {:.2?}", elapsed);
-
-            let now = Instant::now();
-            input = printer::print(&module)?;
-            let elapsed = now.elapsed();
-            info!("print: {:.2?}", elapsed);
         }
     };
 
