@@ -1,7 +1,4 @@
-pub mod ast;
-pub mod parser;
-pub mod printer;
-pub mod traverse;
+use core_wasm_ast as ast;
 pub mod wasi;
 
 pub fn update_value<T>(input: &mut Vec<u8>, old_value: &ast::Value<T>, new_value: T) -> usize

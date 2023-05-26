@@ -1,6 +1,6 @@
-use crate::ast;
-use crate::traverse::{traverse, Visitor, VisitorContext, WasmModule};
 use crate::wasi;
+use core_wasm_ast as ast;
+use core_wasm_ast::traverse::{traverse, Visitor, VisitorContext, WasmModule};
 use std::sync::Arc;
 use std::sync::Mutex;
 

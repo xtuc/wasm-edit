@@ -1,3 +1,4 @@
+use core_wasm_ast as ast;
 use log::info;
 use std::io::stdin;
 use std::io::stdout;
@@ -8,9 +9,9 @@ use std::time::Instant;
 
 mod instrument;
 mod wasi;
-use wasm_edit::{ast, parser, printer, traverse, update_value};
+use wasm_edit::update_value;
 
-pub(crate) type BoxError = Box<dyn std::error::Error>;
+pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 use clap::{Parser, Subcommand};
 
@@ -45,7 +46,8 @@ fn main() -> Result<(), BoxError> {
 
     let now = Instant::now();
     let module = Arc::new(
-        parser::decode(&input).map_err(|err| format!("failed to parse Wasm module: {}", err))?,
+        wasm_parser::parse(&input)
+            .map_err(|err| format!("failed to parse Wasm module: {}", err))?,
     );
     let elapsed = now.elapsed();
     info!("decode: {:.2?}", elapsed);
@@ -53,10 +55,10 @@ fn main() -> Result<(), BoxError> {
     match args.cmd {
         Commands::EditMemory { initial_memory } => {
             if let Some(initial_memory) = initial_memory {
-                let (mem, section_size) = get_main_memory(&module).unwrap();
+                let (mem, section_size) = get_main_memory(Arc::clone(&module)).unwrap();
 
                 // Update value in memory struct
-                let diff = update_value(&mut input, &mem.initial_memory, initial_memory);
+                let diff = update_value(&mut input, &mem.min, initial_memory);
                 if diff != 0 {
                     // Update section size with size diff
                     update_value(&mut input, &section_size, section_size.value + diff as u32);
@@ -66,7 +68,7 @@ fn main() -> Result<(), BoxError> {
 
         Commands::InstrumentMemory { .. } => {
             instrument::transform(Arc::clone(&module));
-            input = printer::print(&module)?;
+            input = wasm_printer::wasm::print(&module)?;
         }
     };
 
@@ -74,7 +76,7 @@ fn main() -> Result<(), BoxError> {
     Ok(())
 }
 
-fn get_main_memory<'a>(module: &'a ast::Module) -> Option<(ast::Memory, ast::Value<u32>)> {
+fn get_main_memory<'a>(module: Arc<ast::Module>) -> Option<(ast::Memory, ast::Value<u32>)> {
     for section in module.sections.lock().unwrap().iter() {
         match &section.value {
             ast::Section::Memory((size, memories)) => {

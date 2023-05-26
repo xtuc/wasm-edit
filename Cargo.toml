@@ -5,7 +5,7 @@ edition = "2021"
 description = "Edit and instrument already compiled Wasm binaries"
 authors = ["Sven Sauleau <sven@cloudflare.com>"]
 license = "MIT"
-keywords = ["wasm", "edit", "transform", "parser", "instrument"]
+keywords = ["wasm", "edit", "transform", "instrument"]
 repository = "https://github.com/xtuc/wasm-edit"
 include = ["runtime/build/runtime.wasm", "src/"]
 
@@ -18,3 +18,6 @@ env_logger = "0.9.1"
 log = "0.4.17"
 threadpool = "1.8.1"
 num_cpus = "1.14.0"
+wasm-parser = "0.1.14"
+core-wasm-ast = "0.1.14"
+wasm-printer = "0.1.14"

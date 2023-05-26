@@ -78,6 +78,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "colored"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3616f750b84d8f0de8a58bda93e08e2a81ad3f523089b05f1dffecab48c6cbd"
+dependencies = [
+ "atty",
+ "lazy_static",
+ "winapi",
+]
+
+[[package]]
+name = "core-wasm-ast"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11461dd7619902aac39398de3894c55739b87115cf29b231265f4c909058ee28"
+dependencies = [
+ "log",
+ "num_cpus",
+ "threadpool",
+ "wasm-coredump-types",
+]
+
+[[package]]
 name = "env_logger"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -110,6 +133,12 @@ name = "humantime"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a3a5bfb195931eeb336b2a7b4d761daec841b97f947d34394601737a7bba5e4"
+
+[[package]]
+name = "lazy_static"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2abad23fbc42b3700f2f279844dc832adb2b2eb069b2df918f455c4e18cc646"
 
 [[package]]
 name = "leb128"
@@ -283,17 +312,65 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
 
 [[package]]
+name = "wasm-coredump-encoder"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0130624de91e13a6be21fc8595f7351425e365641d9664ec79d659e1bd2a8eb6"
+dependencies = [
+ "leb128",
+ "wasm-coredump-types",
+]
+
+[[package]]
+name = "wasm-coredump-types"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1cbea8ddb142d1899854b060b57c79c2b9576b845ff32e9311b624fe0aad8b8f"
+
+[[package]]
 name = "wasm-edit"
 version = "0.1.6"
 dependencies = [
  "byteorder",
  "clap",
+ "core-wasm-ast",
  "env_logger",
  "leb128",
  "log",
  "nom",
  "num_cpus",
  "threadpool",
+ "wasm-parser",
+ "wasm-printer",
+]
+
+[[package]]
+name = "wasm-parser"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d16f851b8a1892d2981c7fefa02b085252f8f1f648644fa1987252aafc6c4cc9"
+dependencies = [
+ "core-wasm-ast",
+ "env_logger",
+ "leb128",
+ "log",
+ "nom",
+ "wasm-coredump-types",
+]
+
+[[package]]
+name = "wasm-printer"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d42482617f7e26f608ab0253e843fd8d30b76f819a79267b1e338f7dd4ac9ee"
+dependencies = [
+ "byteorder",
+ "colored",
+ "core-wasm-ast",
+ "leb128",
+ "log",
+ "wasm-coredump-encoder",
+ "wasm-coredump-types",
 ]
 
 [[package]]

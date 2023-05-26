@@ -1,4 +1,4 @@
-use crate::ast;
+use core_wasm_ast as ast;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
