@@ -90,9 +90,9 @@ dependencies = [
 
 [[package]]
 name = "core-wasm-ast"
-version = "0.1.14"
+version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11461dd7619902aac39398de3894c55739b87115cf29b231265f4c909058ee28"
+checksum = "d0bd90beb0d698ba2246a25a8fac6626b99f883fa26d9a6746ed07ae80ab2cb7"
 dependencies = [
  "log",
  "num_cpus",
@@ -313,9 +313,9 @@ checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
 
 [[package]]
 name = "wasm-coredump-encoder"
-version = "0.1.14"
+version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0130624de91e13a6be21fc8595f7351425e365641d9664ec79d659e1bd2a8eb6"
+checksum = "6b78901e352d547edcaa8e5ee9e77bcdf354f7b67c327225839243c6c24c6747"
 dependencies = [
  "leb128",
  "wasm-coredump-types",
@@ -323,13 +323,13 @@ dependencies = [
 
 [[package]]
 name = "wasm-coredump-types"
-version = "0.1.14"
+version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1cbea8ddb142d1899854b060b57c79c2b9576b845ff32e9311b624fe0aad8b8f"
+checksum = "6b3ba1c7b0d578f4733643ec18f35bd81a57197debb1d35be631787630ae615b"
 
 [[package]]
 name = "wasm-edit"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "byteorder",
  "clap",
@@ -346,9 +346,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-parser"
-version = "0.1.14"
+version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d16f851b8a1892d2981c7fefa02b085252f8f1f648644fa1987252aafc6c4cc9"
+checksum = "093ff3f06a8c2fb69ba34576dfd11d0b92f8d0664f07f5d17ef08413a8a9d27e"
 dependencies = [
  "core-wasm-ast",
  "env_logger",
@@ -360,9 +360,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-printer"
-version = "0.1.14"
+version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d42482617f7e26f608ab0253e843fd8d30b76f819a79267b1e338f7dd4ac9ee"
+checksum = "7c871f3c1f4d2387ce6bf7bfe538c5be0914428b75640ad487af606b375bbf2a"
 dependencies = [
  "byteorder",
  "colored",

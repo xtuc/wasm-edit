@@ -55,13 +55,28 @@ fn main() -> Result<(), BoxError> {
     match args.cmd {
         Commands::EditMemory { initial_memory } => {
             if let Some(initial_memory) = initial_memory {
-                let (mem, section_size) = get_main_memory(Arc::clone(&module)).unwrap();
+                if let Some((mem, section_size)) = get_main_memory(Arc::clone(&module)) {
+                    // Update value in memory struct
+                    let diff = update_value(&mut input, &mem.min, initial_memory);
+                    if diff != 0 {
+                        // Update section size with size diff
+                        let new_size = section_size.value as isize + diff;
+                        assert!(new_size > 0);
+                        update_value(&mut input, &section_size, new_size as u32);
+                    }
+                    eprintln!("updated memory");
+                }
 
-                // Update value in memory struct
-                let diff = update_value(&mut input, &mem.min, initial_memory);
-                if diff != 0 {
-                    // Update section size with size diff
-                    update_value(&mut input, &section_size, section_size.value + diff as u32);
+                if let Some((import, section_size)) = get_memory_import(Arc::clone(&module)) {
+                    // Update value in memory struct
+                    let diff = update_value(&mut input, &import.min, initial_memory);
+                    if diff != 0 {
+                        // Update section size with size diff
+                        let new_size = section_size.value as isize + diff;
+                        assert!(new_size > 0);
+                        update_value(&mut input, &section_size, new_size as u32);
+                    }
+                    eprintln!("updated imported memory");
                 }
             }
         }
@@ -76,11 +91,31 @@ fn main() -> Result<(), BoxError> {
     Ok(())
 }
 
-fn get_main_memory<'a>(module: Arc<ast::Module>) -> Option<(ast::Memory, ast::Value<u32>)> {
+fn get_main_memory(module: Arc<ast::Module>) -> Option<(ast::Memory, ast::Value<u32>)> {
     for section in module.sections.lock().unwrap().iter() {
         match &section.value {
             ast::Section::Memory((size, memories)) => {
                 return Some((memories.first().unwrap().to_owned(), size.to_owned()));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn get_memory_import(module: Arc<ast::Module>) -> Option<(ast::Memory, ast::Value<u32>)> {
+    for section in module.sections.lock().unwrap().iter() {
+        match &section.value {
+            ast::Section::Import((size, imports)) => {
+                for import in imports.lock().unwrap().iter() {
+                    match &import.import_type {
+                        ast::ImportType::Memory(mem) => {
+                            return Some((mem.clone(), size.to_owned()));
+                        }
+                        _ => {}
+                    }
+                }
             }
             _ => {}
         }

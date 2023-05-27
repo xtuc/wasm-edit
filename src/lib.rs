@@ -1,11 +1,10 @@
 use core_wasm_ast as ast;
 pub mod wasi;
 
-pub fn update_value<T>(input: &mut Vec<u8>, old_value: &ast::Value<T>, new_value: T) -> usize
+pub fn update_value<T>(input: &mut Vec<u8>, old_value: &ast::Value<T>, new_value: T) -> isize
 where
     T: ToBytes + std::fmt::Debug,
 {
-    eprintln!("replace {:?} with {:?}", old_value, new_value);
     // FIXME: use vec splice
 
     let old_value_len = old_value.end_offset - old_value.start_offset;
@@ -22,7 +21,14 @@ where
 
     *input = new_input;
 
-    new_bytes.len() - old_value_len
+    let diff = new_bytes.len() as isize - old_value_len as isize;
+
+    eprintln!(
+        "replace {:?} with {:?} ({:?}); diff {:?}",
+        old_value, new_value, new_bytes, diff
+    );
+
+    diff
 }
 
 pub trait ToBytes {
